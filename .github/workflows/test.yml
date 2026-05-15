@@ -61,8 +61,19 @@ jobs:
           curl -fsSL -o libduckdb.zip \
             "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/${{ matrix.duckdb_asset }}"
           unzip -q libduckdb.zip -d libduckdb
-          sudo cp libduckdb/libduckdb.dylib /usr/local/lib/
-          ls -lh /usr/local/lib/libduckdb.dylib
+          # /usr/local/lib doesn't exist on Apple Silicon runners (Homebrew
+          # lives in /opt/homebrew there). Stage to whichever Homebrew prefix
+          # exists, falling back to /usr/local. The driver's findDuckDBLibrary()
+          # checks both paths, and lib/Makefile auto-detects /opt/homebrew.
+          if [ -d /opt/homebrew ]; then
+            BREW_PREFIX=/opt/homebrew
+          else
+            BREW_PREFIX=/usr/local
+          fi
+          sudo mkdir -p "$BREW_PREFIX/lib" "$BREW_PREFIX/include"
+          sudo cp libduckdb/libduckdb.dylib "$BREW_PREFIX/lib/"
+          sudo cp libduckdb/duckdb.h        "$BREW_PREFIX/include/" || true
+          ls -lh "$BREW_PREFIX/lib/libduckdb.dylib"
 
       - name: Build platform-tagged FFI shim
         run: |
