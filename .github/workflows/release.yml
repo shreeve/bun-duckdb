@@ -17,6 +17,12 @@ jobs:
   build-shim:
     name: build-shim ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
+    # macos-13 (Intel) runners are scarce on GitHub and can sit queued for
+    # hours. Mark darwin-x64 as optional so a wedged Intel runner doesn't
+    # block the publish forever — the resulting tarball just ships without
+    # the Intel-Mac shim, and Intel users fall back to `make -C lib`.
+    continue-on-error: ${{ matrix.optional == true }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -25,18 +31,22 @@ jobs:
             os: ubuntu-latest
             duckdb_asset: libduckdb-linux-amd64.zip
             shim_artifact: libduckdb-shim-linux-x64.so
+            optional: false
           - label: linux-arm64
             os: ubuntu-24.04-arm
             duckdb_asset: libduckdb-linux-arm64.zip
             shim_artifact: libduckdb-shim-linux-arm64.so
+            optional: false
           - label: darwin-x64
             os: macos-13
             duckdb_asset: libduckdb-osx-universal.zip
             shim_artifact: libduckdb-shim-darwin-x64.dylib
+            optional: true
           - label: darwin-arm64
             os: macos-latest
             duckdb_asset: libduckdb-osx-universal.zip
             shim_artifact: libduckdb-shim-darwin-arm64.dylib
+            optional: false
     steps:
       - uses: actions/checkout@v4
 
@@ -104,13 +114,38 @@ jobs:
           path: lib-shims
 
       - name: Stage shims into lib/
+        # Each matrix shim is uploaded as its own artifact. Required shims
+        # (linux-x64, linux-arm64, darwin-arm64) must all be present. The
+        # darwin-x64 shim is optional — if its build job hung in queue
+        # and never produced an artifact, we ship without it and warn
+        # rather than fail the release.
         run: |
-          set -euo pipefail
-          cp lib-shims/libduckdb-shim-linux-x64.so/libduckdb-shim-linux-x64.so   lib/
-          cp lib-shims/libduckdb-shim-linux-arm64.so/libduckdb-shim-linux-arm64.so lib/
-          cp lib-shims/libduckdb-shim-darwin-x64.dylib/libduckdb-shim-darwin-x64.dylib lib/
-          cp lib-shims/libduckdb-shim-darwin-arm64.dylib/libduckdb-shim-darwin-arm64.dylib lib/
-          ls -lh lib/libduckdb-shim-*
+          set -uo pipefail   # NOT -e: we want the missing-optional path to succeed
+
+          stage() {
+            local name=$1
+            local required=$2
+            local src="lib-shims/$name/$name"
+            if [ -f "$src" ]; then
+              cp "$src" lib/
+              echo "  ✅ staged $name"
+            elif [ "$required" = "required" ]; then
+              echo "::error::Required shim $name was not produced by build-shim job."
+              exit 1
+            else
+              echo "::warning::Optional shim $name not available — tarball will ship without it."
+              echo "  ⚠ skipped $name (Intel-Mac users will need to \`make -C lib\`)"
+            fi
+          }
+
+          stage libduckdb-shim-linux-x64.so       required
+          stage libduckdb-shim-linux-arm64.so     required
+          stage libduckdb-shim-darwin-arm64.dylib required
+          stage libduckdb-shim-darwin-x64.dylib   optional
+
+          echo
+          echo "=== final lib/ contents ==="
+          ls -lh lib/libduckdb-shim-* 2>&1 || echo "(none)"
 
       - name: Verify package version matches tag
         run: |

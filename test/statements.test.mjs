@@ -94,6 +94,46 @@ d('Statement reuse', () => {
   });
 });
 
+d('executeBatchPrepared', () => {
+  test('exists as a public method on Connection', () => {
+    using conn = db.connect();
+    expect(typeof conn.executeBatchPrepared).toBe('function');
+  });
+
+  test('inserts multiple param sets through a single prepared handle', async () => {
+    using conn = db.connect();
+    await conn.exec('CREATE TABLE t (id INTEGER, name VARCHAR)');
+    const result = await conn.executeBatchPrepared(
+      'INSERT INTO t VALUES (?, ?)',
+      [[1, 'a'], [2, 'b'], [3, 'c']],
+    );
+    expect(result.rows).toBe(3);
+    const rows = await conn.all('SELECT * FROM t ORDER BY id');
+    expect(rows).toHaveLength(3);
+    expect(rows[0]).toEqual({ id: 1, name: 'a' });
+    expect(rows[2]).toEqual({ id: 3, name: 'c' });
+  });
+
+  test('empty batch returns rows:0 without error', async () => {
+    using conn = db.connect();
+    await conn.exec('CREATE TABLE t (n INT)');
+    const result = await conn.executeBatchPrepared('INSERT INTO t VALUES (?)', []);
+    expect(result.rows).toBe(0);
+  });
+
+  test('queryBatch is an alias and remains usable for back-compat', async () => {
+    using conn = db.connect();
+    expect(typeof conn.queryBatch).toBe('function');
+    await conn.exec('CREATE TABLE t (n INT)');
+    const result = await conn.queryBatch('INSERT INTO t VALUES (?)', [[10], [20]]);
+    expect(result.rows).toBe(2);
+    // Verify the alias is really doing the same work as the canonical
+    // method, not a stub: rows should actually land in the table.
+    const rows = await conn.all('SELECT n FROM t ORDER BY n');
+    expect(rows).toEqual([{ n: 10 }, { n: 20 }]);
+  });
+});
+
 d('Statement lifecycle', () => {
   test('close() is idempotent', async () => {
     const stmt = await db.prepare('SELECT 1');

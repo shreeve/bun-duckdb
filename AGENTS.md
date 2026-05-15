@@ -35,7 +35,7 @@ workarounds, and conventions for extending the driver.
                                   pass structs by value)
 ```
 
-The whole driver is one file (`lib/duckdb.mjs`, ~1100 lines) plus a
+The whole driver is one file (`lib/duckdb.mjs`, ~1500 lines) plus a
 ~30-line C shim. No build step for users (the shim is pre-shipped or
 built once with `make`).
 
@@ -193,9 +193,11 @@ works on Linux x64.
 
 ### DuckDB → JS conversions
 
-Implemented in the chunk-decoding loop in `lib/duckdb.mjs`. Each
-`DUCKDB_TYPE` enum value maps to a reader function that pulls the
-right primitive from chunk vector memory via `Bun.ffi.read.*`.
+Implemented in the chunk-decoding loop in `lib/duckdb.mjs` (`#readValue`).
+Each `DUCKDB_TYPE` enum value maps to a reader function that pulls the
+right primitive from chunk vector memory via `Bun.ffi.read.*`. The
+authoritative contract lives in the `#readValue` docstring; this table
+is a summary. Keep them in sync when editing either.
 
 | DuckDB type | Reader | JS value |
 |---|---|---|
@@ -203,23 +205,25 @@ right primitive from chunk vector memory via `Bun.ffi.read.*`.
 | `TINYINT` | `ffiRead.i8` | `number` |
 | `SMALLINT` | `ffiRead.i16` | `number` |
 | `INTEGER` | `ffiRead.i32` | `number` |
-| `BIGINT` | `ffiRead.i64` | `bigint` |
-| `HUGEINT` | 128-bit composite | `bigint` (best-effort) |
+| `UTINYINT`/`USMALLINT`/`UINTEGER` | `ffiRead.u{8,16,32}` | `number` |
+| `BIGINT`/`UBIGINT` | `ffiRead.i64`/`u64` | `number` (lossy above 2^53) |
+| `HUGEINT`/`UHUGEINT` | 128-bit composite | `string` (decimal) |
 | `FLOAT` | `ffiRead.f32` | `number` |
 | `DOUBLE` | `ffiRead.f64` | `number` |
-| `DECIMAL` | scaled integer | `number` (precision-aware) |
+| `DECIMAL` | scaled integer ÷ 10^scale | `string` (decimal) |
 | `VARCHAR` | inline-or-pointer string | `string` |
-| `BLOB` | inline-or-pointer bytes | `Uint8Array` |
-| `DATE` | `ffiRead.i32` (days since epoch) | `Date` |
-| `TIME` | microseconds since midnight | `string` (ISO time) |
-| `TIMESTAMP` | `ffiRead.i64` (microseconds since epoch) | `Date` |
-| `INTERVAL` | composite | `{ months, days, micros }` |
-| `UUID` | 16 bytes | `string` (canonical form) |
+| `BLOB` | inline-or-pointer bytes | `Uint8Array` (copy) |
+| `DATE` | `ffiRead.i32` (days since epoch) | `string` (`"YYYY-MM-DD"`) |
+| `TIME`/`TIME_NS`/`TIME_TZ` | microseconds / nanoseconds | `string` (ISO-ish) |
+| `TIMESTAMP`/`TIMESTAMP_{S,MS,NS,TZ}` | `ffiRead.i64` (microseconds since epoch) | `Date` |
+| `INTERVAL` | composite | `string` (`"3 months 2 days 1.5 seconds"`) |
+| `UUID` | 16 bytes | `string` (canonical 8-4-4-4-12) |
 | `LIST`/`ARRAY` | child vector iteration | `Array` |
-| `STRUCT` | child vector tuple | `object` |
-| `MAP` | LIST of STRUCT(key,value) | `Map` |
+| `STRUCT` | child vector tuple | `object` (plain `{}`) |
+| `MAP` | LIST of STRUCT(key,value) | `object` (plain `{}`, keys stringified) |
 | `ENUM` | dictionary index | `string` |
-| `NULL` | validity bitmap | `null` |
+| `BIT`/`UNION` | not implemented | `null` |
+| `NULL` (validity bit clear) | validity bitmap | `null` |
 
 ### Validity (NULL) handling
 

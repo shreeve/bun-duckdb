@@ -4,6 +4,60 @@ All notable changes documented here. Versioning follows
 [semver](https://semver.org/) — `0.x` releases may make breaking changes
 between minor versions until the `1.0.0` API freeze.
 
+## Unreleased — planned 0.2.2
+
+Documentation-correctness patch. The public API surface didn't match
+what the code actually did in a few places — this release pulls them
+back into alignment and fixes one real data-corruption bug. Tag and
+publish with `git tag v0.2.2 && git push --tags` once you're ready.
+
+### Fixed
+
+- **`Connection.executeBatchPrepared(sql, batches)` now actually
+  exists.** The method was documented in README/`.d.ts`/CHANGELOG since
+  v0.1, but the runtime only exposed it under its original (undocumented)
+  name `queryBatch`. The documented name is now the canonical one;
+  `queryBatch` is retained as a back-compat alias.
+- **`BLOB` columns now return `Uint8Array` (the documented contract)
+  instead of a UTF-8 string.** The previous decoder ran blob bytes
+  through `TextDecoder`, which replaced any non-UTF-8 byte with
+  `U+FFFD` and silently corrupted binary data. The new path copies
+  bytes out of DuckDB-owned vector memory verbatim, so the returned
+  array is safe to retain across chunk destruction.
+- **Parameter binding (and the Appender) now accepts `Uint8Array` /
+  `ArrayBuffer` and binds them as `BLOB`** via `duckdb_bind_blob` /
+  `duckdb_append_blob`. Previously these JS values fell through to
+  `String(value)` and were bound as `VARCHAR` (`"72,69,76,..."` —
+  comma-joined byte values), which silently corrupted the data. The
+  README's parameter-binding table already advertised `Uint8Array →
+  BLOB`, so this brings the runtime up to the documented contract.
+
+### Changed
+
+- **`README.md` and `AGENTS.md` type-mapping tables rewritten** to
+  describe what the code actually returns. Notable corrections:
+  `BIGINT`/`UBIGINT` → `number` (with explicit precision caveat at
+  2^53); `HUGEINT`/`UHUGEINT`/`DECIMAL` → decimal `string`; `DATE` →
+  `"YYYY-MM-DD"` string; `INTERVAL` → formatted `string`; `MAP` →
+  plain `object` (not `Map`); `BIT`/`UNION` → `null` (not implemented).
+  The `#readValue` docstring in `lib/duckdb.mjs` is the authoritative
+  source — both tables are derived from it.
+- **`examples/appender.mjs`** updated its `console.log` comment to
+  reflect the actual decoded value (`{ n: 100000 }`, not `100000n`).
+
+### Tests
+
+- Added BLOB tests for: small (≤ 12 byte inline), large (> 12 byte
+  pointer storage), empty, and non-UTF-8 byte sequences. Together they
+  pin the byte-exact round-trip of `BLOB → Uint8Array`.
+- Added a "bytes survive result destruction" test that holds onto a
+  BLOB across many subsequent queries and asserts the bytes are still
+  intact — locks in the copy-out-of-DuckDB-memory semantic.
+- Added round-trip tests for binding `Uint8Array` / `ArrayBuffer` as
+  BLOB (both via prepared parameters and via the Appender).
+- Added `executeBatchPrepared` tests for: method existence, multi-row
+  insert, empty batch, and the `queryBatch` alias.
+
 ## 0.2.1 — 2026-05-14
 
 Install-friction patch. Pre-built shim binaries now ship in the npm

@@ -35,9 +35,11 @@ const elapsed = Date.now() - before;
 
 console.log(`Inserted ${result.rows} rows in ${elapsed}ms`);
 
-// Verify (query() returns the rows array directly)
+// Verify (query() returns the rows array directly).
+// COUNT(*) is a BIGINT in DuckDB, which the driver decodes as a JS
+// `number` (lossy above 2^53; documented in the type-mapping table).
 const count = await conn.query('SELECT COUNT(*) AS n FROM measurements');
-console.log(count);             // [{ n: 100000n }]
+console.log(count[0]);          // { n: 100000 }
 
 conn.close();
 db.close();

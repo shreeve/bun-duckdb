@@ -388,28 +388,40 @@ the number of affected rows (as `BigInt` — DuckDB returns this as
 
 ### Type mapping
 
-| DuckDB type | JavaScript value |
-|---|---|
-| `BOOLEAN` | `boolean` |
-| `TINYINT`, `SMALLINT`, `INTEGER` | `number` |
-| `UTINYINT`, `USMALLINT`, `UINTEGER` | `number` |
-| `BIGINT`, `UBIGINT` | `bigint` |
-| `HUGEINT`, `UHUGEINT` | `bigint` (when in safe range; may overflow for very large values) |
-| `FLOAT`, `DOUBLE` | `number` |
-| `DECIMAL` | `number` (precision-aware; very large values may lose precision — see Roadmap for upcoming `string` mode) |
-| `VARCHAR`, `CHAR` | `string` |
-| `BLOB` | `Uint8Array` |
-| `DATE` | `Date` (UTC midnight) |
-| `TIME`, `TIME_TZ`, `TIME_NS` | `string` (ISO time) |
-| `TIMESTAMP`, `TIMESTAMP_TZ`, `TIMESTAMP_MS`, `TIMESTAMP_SEC` | `Date` |
-| `TIMESTAMP_NS` | `Date` (truncated to millisecond precision) |
-| `INTERVAL` | `{ months, days, micros }` |
-| `UUID` | `string` (canonical 8-4-4-4-12 form) |
-| `LIST`, `ARRAY` | `Array` |
-| `STRUCT` | object |
-| `MAP` | `Map` |
-| `ENUM` | `string` |
-| `NULL` | `null` |
+What you get back from a query, by DuckDB column type. The contract is
+geared toward "values stay JSON-safe by default; precision-sensitive
+types fall back to strings".
+
+| DuckDB type | JavaScript value | Notes |
+|---|---|---|
+| `BOOLEAN` | `boolean` | |
+| `TINYINT`, `SMALLINT`, `INTEGER` | `number` | always safe (32-bit) |
+| `UTINYINT`, `USMALLINT`, `UINTEGER` | `number` | always safe (32-bit) |
+| `BIGINT`, `UBIGINT` | `number` | **lossy above `2^53`** — see "Precision" below |
+| `HUGEINT`, `UHUGEINT` | `string` | decimal string, full precision |
+| `FLOAT`, `DOUBLE` | `number` | |
+| `DECIMAL` | `string` | decimal string, full precision |
+| `VARCHAR`, `CHAR` | `string` | UTF-8 |
+| `BLOB` | `Uint8Array` | raw bytes, copied out of DuckDB-owned memory |
+| `DATE` | `string` | `"YYYY-MM-DD"` |
+| `TIME`, `TIME_NS`, `TIME_TZ` | `string` | ISO-ish formatted time (TZ includes `+HH:MM`) |
+| `TIMESTAMP`, `TIMESTAMP_S`, `TIMESTAMP_MS`, `TIMESTAMP_TZ` | `Date` | UTC |
+| `TIMESTAMP_NS` | `Date` | truncated to millisecond precision |
+| `INTERVAL` | `string` | e.g. `"3 months 2 days 1.5 seconds"` |
+| `UUID` | `string` | canonical 8-4-4-4-12 form |
+| `ENUM` | `string` | dictionary lookup |
+| `LIST`, `ARRAY` | `Array` | |
+| `STRUCT` | `object` | plain `{}` |
+| `MAP` | `object` | plain `{}` (keys stringified) — *not* a `Map` |
+| `NULL` | `null` | |
+| `BIT`, `UNION` | `null` | not yet decoded — surfaces as `null` |
+
+**Precision.** `BIGINT`/`UBIGINT` are returned as `number` so they fit
+naturally into JSON and arithmetic. Values beyond `2^53` lose precision.
+If you need full precision, cast to `HUGEINT`/`DECIMAL` in SQL or read
+the raw integer via a `VARCHAR` cast. A future opt-in mode (planned)
+will let you elect `bigint` returns for `BIGINT`/`UBIGINT` and `string`
+returns for `DECIMAL`/large integers from a single config.
 
 `DUCKDB_TYPE` is exported as a frozen object mapping type names to
 DuckDB's internal integer IDs, useful when introspecting `result.columns`.
@@ -422,12 +434,13 @@ Use `?` placeholders. Values are mapped to DuckDB types automatically:
 |---|---|
 | `null`, `undefined` | `NULL` |
 | `boolean` | `BOOLEAN` |
-| Integer `number` (and within int32 range) | `INTEGER` |
-| Other `number` | `DOUBLE` |
+| `number` (integer) | `BIGINT` (`duckdb_bind_int64`) |
+| `number` (non-integer) | `DOUBLE` |
 | `bigint` | `BIGINT` |
 | `string` | `VARCHAR` |
-| `Uint8Array` / `ArrayBuffer` | `BLOB` |
-| `Date` | `TIMESTAMP` |
+| `Uint8Array`, `ArrayBuffer` | `BLOB` (`duckdb_bind_blob`, byte-exact) |
+| `Date` | `VARCHAR` ISO-8601 string (use `CAST(? AS TIMESTAMP)` for the typed form) |
+| anything else | stringified via `String(value)` and bound as `VARCHAR` |
 
 For typed parameters beyond what auto-detection picks, use explicit
 SQL casts: `'SELECT CAST(? AS UINTEGER)'`.

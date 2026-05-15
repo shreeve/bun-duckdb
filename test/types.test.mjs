@@ -115,9 +115,78 @@ d('strings', () => {
     expect(rows[0].val).toBe('');
   });
 
-  test('BLOB', async () => {
-    const rows = await conn.query("SELECT '\\x48454C4C4F'::BLOB AS val");
-    expect(rows[0].val).toBeTruthy();
+  test('BLOB returns Uint8Array', async () => {
+    const rows = await conn.query("SELECT '\\x48\\x45\\x4C\\x4C\\x4F'::BLOB AS val");
+    expect(rows[0].val).toBeInstanceOf(Uint8Array);
+    expect([...rows[0].val]).toEqual([0x48, 0x45, 0x4C, 0x4C, 0x4F]);
+  });
+
+  test('BLOB preserves non-UTF-8 bytes (does not corrupt through TextDecoder)', async () => {
+    const rows = await conn.query(
+      "SELECT '\\xFF\\x00\\xFE\\x80\\xC2'::BLOB AS val",
+    );
+    expect(rows[0].val).toBeInstanceOf(Uint8Array);
+    expect([...rows[0].val]).toEqual([0xFF, 0x00, 0xFE, 0x80, 0xC2]);
+  });
+
+  test('BLOB larger than the 12-byte inline limit', async () => {
+    // Force the pointer-storage path in DuckDB's string_t (length > 12).
+    const rows = await conn.query(
+      "SELECT from_hex('000102030405060708090A0B0C0D0E0F1011121314151617') AS val",
+    );
+    expect(rows[0].val).toBeInstanceOf(Uint8Array);
+    expect(rows[0].val.length).toBe(24);
+    expect([...rows[0].val]).toEqual(
+      Array.from({ length: 24 }, (_, i) => i),
+    );
+  });
+
+  test('empty BLOB', async () => {
+    const rows = await conn.query("SELECT from_hex('') AS val");
+    expect(rows[0].val).toBeInstanceOf(Uint8Array);
+    expect(rows[0].val.length).toBe(0);
+  });
+
+  test('BLOB round-trip: bind Uint8Array → read Uint8Array', async () => {
+    const original = new Uint8Array([0x48, 0x45, 0x4C, 0x4C, 0x4F, 0xFF, 0x00]);
+    const rows = await conn.query('SELECT CAST(? AS BLOB) AS val', [original]);
+    expect(rows[0].val).toBeInstanceOf(Uint8Array);
+    expect([...rows[0].val]).toEqual([...original]);
+  });
+
+  test('BLOB round-trip: bind ArrayBuffer → read Uint8Array', async () => {
+    const buf = new ArrayBuffer(5);
+    new Uint8Array(buf).set([0xDE, 0xAD, 0xBE, 0xEF, 0x42]);
+    const rows = await conn.query('SELECT CAST(? AS BLOB) AS val', [buf]);
+    expect(rows[0].val).toBeInstanceOf(Uint8Array);
+    expect([...rows[0].val]).toEqual([0xDE, 0xAD, 0xBE, 0xEF, 0x42]);
+  });
+
+  test('BLOB round-trip via Appender preserves binary bytes', async () => {
+    await conn.query('CREATE TABLE t_blob (b BLOB)');
+    const a = new Uint8Array([0xFF, 0x00, 0xFE]);
+    const b = new Uint8Array([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+                              0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10]);
+    await conn.append('t_blob', ['b'], [[a], [b]]);
+    const rows = await conn.query('SELECT b FROM t_blob ORDER BY octet_length(b)');
+    expect([...rows[0].b]).toEqual([...a]);
+    expect([...rows[1].b]).toEqual([...b]);
+    await conn.query('DROP TABLE t_blob');
+  });
+
+  test('BLOB bytes survive result destruction (decoder copies out of DuckDB memory)', async () => {
+    // The driver tears down the result struct + chunk after #extractChunks
+    // returns. If readBytes ever returned a view backed by DuckDB-owned
+    // memory, the bytes would silently corrupt after that point. Force
+    // some additional churn before asserting to amplify the chance of
+    // a freed-memory regression failing the test.
+    let blob;
+    {
+      const rows = await conn.query("SELECT from_hex('FF00FE80C2DEADBEEF') AS val");
+      blob = rows[0].val;
+    }
+    for (let i = 0; i < 50; i++) await conn.query('SELECT 1');
+    expect([...blob]).toEqual([0xFF, 0x00, 0xFE, 0x80, 0xC2, 0xDE, 0xAD, 0xBE, 0xEF]);
   });
 });
 
