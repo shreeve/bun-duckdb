@@ -1,11 +1,23 @@
 # bun-duckdb
 
+[![npm version](https://img.shields.io/npm/v/bun-duckdb.svg)](https://www.npmjs.com/package/bun-duckdb)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Bun ≥1.0](https://img.shields.io/badge/Bun-%E2%89%A51.0-black?logo=bun)](https://bun.sh)
+[![DuckDB](https://img.shields.io/badge/DuckDB-%E2%89%A51.0-yellow?logo=duckdb)](https://duckdb.org)
+[![CI](https://github.com/shreeve/bun-duckdb/actions/workflows/test.yml/badge.svg)](https://github.com/shreeve/bun-duckdb/actions/workflows/test.yml)
+[![TypeScript](https://img.shields.io/badge/TypeScript-ready-3178C6?logo=typescript)](./lib/duckdb.d.ts)
+
 > Efficient DuckDB driver for Bun, using pure FFI
 
 A Bun-native binding to DuckDB's modern C API. No native modules. No
 node-gyp. No N-API marshaling. The driver dlopens `libduckdb` directly
 through `bun:ffi` and uses DuckDB's chunk-based result API for
 column-store reads with minimal overhead.
+
+```bash
+bun add bun-duckdb
+brew install duckdb        # or: apt install libduckdb-dev
+```
 
 ```js
 import { open } from 'bun-duckdb';
@@ -41,11 +53,25 @@ await db.transaction(async (tx) => {
 
 ## Why
 
-| Existing option | Problem |
+### Which package should I use?
+
+| You're on... | You want... | Use |
+|---|---|---|
+| **Bun** | Embedded DuckDB, zero install friction | **`bun-duckdb`** (this package) |
+| **Bun** | A query builder layered on top | `bun-duckdb` + Kysely/Drizzle (when those add support) |
+| **Bun** | Multi-tenant DuckDB via HTTP | `bun-duckdb` + a thin HTTP wrapper, or [duckdb-harbor] (separate project) |
+| **Node** | Embedded DuckDB | [`@duckdb/node-api`](https://www.npmjs.com/package/@duckdb/node-api) (official) |
+| **Browser** | DuckDB in WebAssembly | [`@duckdb/duckdb-wasm`](https://www.npmjs.com/package/@duckdb/duckdb-wasm) |
+
+[duckdb-harbor]: https://github.com/shreeve/duckdb-harbor
+
+### Why this over alternatives on Bun
+
+| Option | Problem on Bun |
 |---|---|
-| `@duckdb/node-api` (official, N-API) | Native build required, value-by-value marshaling overhead, verbose API |
-| `@duckdb/duckdb-wasm` | Browser-only |
-| `node-duckdb` (older) | Abandoned |
+| `@duckdb/node-api` (official, N-API) | Native build required (node-gyp install dance), value-by-value marshaling overhead, verbose API designed for Node |
+| `@duckdb/duckdb-wasm` | Browser-only — full DuckDB inside a 6 MB Wasm module is overkill for server-side Bun |
+| `node-duckdb` (older) | Abandoned, last release before the chunk API |
 
 `bun-duckdb` is built around four properties Bun developers actually want:
 
@@ -111,23 +137,42 @@ sudo dnf install libduckdb
 #   https://github.com/duckdb/duckdb/releases
 ```
 
-### Linux x86_64: build the FFI shim
+### FFI shim — when you need it
 
-On Linux x86_64 only, you must also build a tiny C shim
-(`libduckdb-shim.so`) once. This works around a Bun FFI limitation —
-see [AGENTS.md § FFI Bug 2](./AGENTS.md#bug-2-struct-by-value-passing-is-impossible).
+The driver ships with one tiny C source file (`lib/duckdb-shim.c`,
+~30 lines) that wraps three DuckDB functions which take a 48-byte
+struct by value — something Bun's FFI can't currently do directly on
+Linux x86_64. See [AGENTS.md § FFI Bug 2](./AGENTS.md#bug-2-struct-by-value-passing-is-impossible)
+for the gory details.
+
+| Platform | Shim required? | What to do |
+|---|---|---|
+| **Linux x86_64** | **Yes** | Build & install the shim once (see below) |
+| **Linux arm64** | Recommended | Same as above (the AArch64 ABI is friendlier but having the shim is safer) |
+| **macOS arm64 (Apple Silicon)** | No (works without) | The driver falls back to a direct call. Building the shim still works if you'd rather use that path. |
+| **macOS x86_64 (Intel)** | Recommended | Same as Linux x86_64 |
+| **Windows x86_64** | Untested in v0.2 — let us know if you try it |
+
+To build:
 
 ```bash
+# Inside an installed package
 cd node_modules/bun-duckdb/lib
-make            # produces libduckdb-shim.so next to libduckdb.so search paths
-sudo make install   # optional: installs to /usr/local/lib/
+make                              # → libduckdb-shim.so (Linux) or .dylib (macOS)
+sudo make install                 # optional: → /usr/local/lib/
+
+# In a clone of the repo
+make -C lib
 ```
 
-Override the shim location with `DUCKDB_SHIM_PATH=/your/path/libduckdb-shim.so`.
+Override the shim location with
+`DUCKDB_SHIM_PATH=/path/to/libduckdb-shim.so`. The driver searches a
+few standard locations automatically; setting the env var skips the
+search.
 
-On macOS arm64 the shim is built as `libduckdb-shim.dylib` but the
-driver also has a non-shim fallback that happens to work on that
-platform — building the shim is recommended but not required.
+> **Pre-built shim binaries** are tracked as a v0.3 deliverable so
+> that `bun add bun-duckdb` works without a `make` step on supported
+> platforms. For now, the build is one command and ~30 KB output.
 
 ## Quick start
 
@@ -169,6 +214,39 @@ For bulk insert see [`examples/appender.mjs`](./examples/appender.mjs).
 > on a single Connection safe. The return value is awaitable.
 > A future version may also expose a sync API to match
 > `better-sqlite3` / `bun:sqlite` conventions — see Roadmap.
+
+## TypeScript
+
+Type declarations ship with the package — `import` works in TS without
+extra setup, and `db.query<T>(sql)` lets you narrow the row shape:
+
+```ts
+import { open, type QueryResult, type Statement } from 'bun-duckdb';
+
+interface User { id: number; name: string }
+
+using db = open(':memory:');
+await db.exec('CREATE TABLE users (id INT, name VARCHAR)');
+await db.run('INSERT INTO users VALUES (?, ?), (?, ?)',
+             [1, 'Alice', 2, 'Bob']);
+
+const rows: QueryResult<User> = await db.all<User>(
+  'SELECT * FROM users ORDER BY id',
+);
+
+rows[0].id;        // number
+rows[0].name;      // string
+rows.columns;      // ColumnInfo[]
+rows.rowsChanged;  // bigint
+
+using stmt: Statement<User> = await db.prepare<User>(
+  'SELECT * FROM users WHERE id = ?',
+);
+const alice = await stmt.get([1]);   // User | undefined
+```
+
+The defaults are loose (`Row = Record<string, unknown>`) so untyped
+calls work without ceremony — tighten only when you know the shape.
 
 ## API reference
 
@@ -400,6 +478,10 @@ SQL casts: `'SELECT CAST(? AS UINTEGER)'`.
 
 ### v0.3.0 — planned
 
+- [ ] **Pre-built shim binaries** shipped per-platform (or via
+      `optionalDependencies` à la esbuild) so `bun add bun-duckdb`
+      works on Linux x86_64 / arm64 / macOS x86_64 without a
+      `make` step
 - [ ] `Statement.iterate(params?)` returning `AsyncIterable<T>` for
       streaming large result sets without materialization
 - [ ] `conn.chunks(sql, params?)` exposing raw chunk iteration for

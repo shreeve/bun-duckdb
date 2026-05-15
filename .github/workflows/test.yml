@@ -1,0 +1,75 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: ${{ matrix.os }} (${{ matrix.duckdb }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # Pin a specific DuckDB release; bump as we adopt newer versions.
+        duckdb: ['v1.5.2']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # ----- libduckdb install ------------------------------------------------
+
+      - name: Install libduckdb (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          DUCKDB_VER="${{ matrix.duckdb }}"
+          # GitHub release naming
+          curl -fsSL -o libduckdb.zip \
+            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VER}/libduckdb-linux-amd64.zip"
+          unzip -q libduckdb.zip -d libduckdb
+          sudo cp libduckdb/libduckdb.so /usr/local/lib/
+          sudo cp libduckdb/duckdb.h     /usr/local/include/ || true
+          sudo ldconfig
+          ls -lh /usr/local/lib/libduckdb.so
+
+      - name: Install libduckdb (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # Homebrew has DuckDB; avoid the version mismatch by installing
+          # libduckdb directly from the GitHub release for consistency
+          # across the matrix.
+          set -euo pipefail
+          DUCKDB_VER="${{ matrix.duckdb }}"
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            arm64) ASSET="libduckdb-osx-universal.zip" ;;
+            x86_64) ASSET="libduckdb-osx-universal.zip" ;;
+            *) echo "unsupported arch: $ARCH"; exit 1 ;;
+          esac
+          curl -fsSL -o libduckdb.zip \
+            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VER}/${ASSET}"
+          unzip -q libduckdb.zip -d libduckdb
+          sudo cp libduckdb/libduckdb.dylib /usr/local/lib/
+          ls -lh /usr/local/lib/libduckdb.dylib
+
+      # ----- shim + tests -----------------------------------------------------
+
+      - name: Build FFI shim
+        run: make -C lib
+
+      - name: Run tests
+        run: bun test
+
+      - name: Smoke examples
+        run: |
+          bun examples/basic.mjs
+          bun examples/prepared.mjs
+          bun examples/appender.mjs

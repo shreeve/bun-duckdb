@@ -52,6 +52,7 @@ export interface AppendResult {
 
 /** DuckDB type codes. Frozen object; values are stable per DuckDB release. */
 export const DUCKDB_TYPE: Readonly<{
+  INVALID: 0;
   BOOLEAN: 1;
   TINYINT: 2;
   SMALLINT: 3;

@@ -3,6 +3,7 @@
   "version": "0.2.0",
   "description": "Efficient DuckDB driver for Bun, using pure FFI",
   "type": "module",
+  "sideEffects": false,
   "main": "./lib/duckdb.mjs",
   "types": "./lib/duckdb.d.ts",
   "exports": {
@@ -19,6 +20,7 @@
     "lib/Makefile",
     "README.md",
     "AGENTS.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
@@ -51,9 +53,7 @@
   "engines": {
     "bun": ">=1.0.0"
   },
-  "peerDependenciesMeta": {
-    "bun": {
-      "optional": false
-    }
+  "publishConfig": {
+    "access": "public"
   }
 }
