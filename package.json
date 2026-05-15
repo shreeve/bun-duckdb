@@ -1,0 +1,59 @@
+{
+  "name": "bun-duckdb",
+  "version": "0.2.0",
+  "description": "Efficient DuckDB driver for Bun, using pure FFI",
+  "type": "module",
+  "main": "./lib/duckdb.mjs",
+  "types": "./lib/duckdb.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/duckdb.d.ts",
+      "import": "./lib/duckdb.mjs",
+      "default": "./lib/duckdb.mjs"
+    }
+  },
+  "files": [
+    "lib/duckdb.mjs",
+    "lib/duckdb.d.ts",
+    "lib/duckdb-shim.c",
+    "lib/Makefile",
+    "README.md",
+    "AGENTS.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build:shim": "make -C lib",
+    "test": "bun test",
+    "example:basic": "bun examples/basic.mjs",
+    "example:prepared": "bun examples/prepared.mjs",
+    "example:appender": "bun examples/appender.mjs"
+  },
+  "keywords": [
+    "duckdb",
+    "bun",
+    "ffi",
+    "bun-ffi",
+    "embedded-database",
+    "sql",
+    "analytical-database",
+    "olap"
+  ],
+  "author": "Steve Shreeve <steve.shreeve@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shreeve/bun-duckdb.git"
+  },
+  "bugs": {
+    "url": "https://github.com/shreeve/bun-duckdb/issues"
+  },
+  "homepage": "https://github.com/shreeve/bun-duckdb#readme",
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "bun": {
+      "optional": false
+    }
+  }
+}

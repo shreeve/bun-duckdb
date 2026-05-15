@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+bun.lock
+package-lock.json
+
+# Build artifacts
+lib/*.so
+lib/*.dylib
+lib/*.dll
+lib/*.o
+
+# Test scratch
+*.duckdb
+*.duckdb.tmp
+*.duckdb.wal
+
+# OS / editor
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
+
+# Logs
+*.log
