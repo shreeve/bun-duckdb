@@ -42,9 +42,10 @@ What's loosely promised in CHANGELOG/README but not yet built:
 
 | Promise | Target version | Status |
 |---|---|---|
-| `Statement.iterate()` streaming | v0.3.0 | open |
-| `duckdb-bun/async` worker subpath | v0.4.0 | open |
-| Windows x86_64 support | v0.5.0 | open |
+| `Statement.iterate()` streaming | v0.3.0 | ✅ shipped 2026-05-15 |
+| `duckdb-bun/async` worker subpath | v0.4.0 | ✅ shipped 2026-05-15 |
+| `AbortSignal` / `duckdb_interrupt()` (async only) | v0.5.0 | open — architecture proven by spike; scope 1.5–3 days |
+| Windows x86_64 support | v0.6.0 | open (was v0.5; cancellation took the slot) |
 
 You're being asked to ship those three, in that order, each as a
 separate release. **All three already have opinionated defaults
@@ -1276,6 +1277,36 @@ docs for *how the system is structured*.
 - 2026-05-15 — **v0.3.0 shipped** to npm. End-to-end ship sequence
   succeeded on first try (commit + push + CI green + tag + release.yml
   + npm publish + smoke from fresh tempdir).
+- 2026-05-15 — **v0.4.0 shipped** to npm. duckdb-bun/async Worker
+  subpath. 178 tests passing (134 main + 44 async).
+- 2026-05-15 — **Cancellation spikes (post-v0.4.0).** A user-prompted
+  GPT-5.5 review surfaced a critical architectural question that
+  invalidated the original "half-day cancellation" estimate. Two
+  spikes ran:
+  - **Spike 1:** Worker can't process a `cancel` postMessage while
+    blocked in FFI. JS event loop frozen 611ms during a 711ms query.
+    Confirms the original "worker handles cancel" plan is dead.
+  - **Spike 2:** Main thread can call `duckdb_interrupt(handle)`
+    while the worker is blocked. Interrupt latency 2ms; DuckDB
+    returns `"INTERRUPT Error: Interrupted!"`. **This is the path
+    forward.**
+  Architecture for v0.5: main thread dlopens `duckdb_interrupt`
+  separately; worker sends the raw `duckdb_connection` BigInt as an
+  "interrupt capability" on connect/txnBegin; main stores it but
+  never dereferences from JS. Critical invariant: only call
+  `duckdb_interrupt` when the aborted request is the active one on
+  its connection (worker must emit `requestActive` lifecycle events
+  for v0.5). Scope revised to **1.5–3 days** (was "half a day").
+  Sync subpath will NOT get AbortSignal — sync FFI blocks the JS
+  thread that would receive the event.
+- 2026-05-15 — **v0.4.1 patch shipped** (forward-compat plumbing for
+  v0.5 + iterator race tests). The worker now sends `interruptHandle`
+  and `interruptGeneration` on every `connect` / `txnBegin` response;
+  the proxy caches them in `AsyncDatabase._interruptHandles` keyed by
+  connId. v0.4.1 doesn't USE these handles; v0.5 wires them into
+  `AbortSignal` cancellation. 8 new tests: 5 forward-compat (handle
+  presence, fresh generation tokens, close cleanup) + 3 iterator
+  prefetch/return races. 186 total tests passing.
 - 2026-05-15 — **v0.4.0 work item completed locally** (ship-ready;
   awaiting user-mediated commit/tag). Notes from implementation:
   - RFC `docs/rfcs/0001-worker-async-api.md` written first per the

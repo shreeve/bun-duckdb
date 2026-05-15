@@ -848,28 +848,80 @@ spiked or decided before approval.
    document the chosen default with one sentence of rationale.
 4. **Close timeout — RESOLVED.** Opt-in via `close({ timeout })`. No
    default. See §11.
-5. **`AbortSignal` / cancellation — RESOLVED (deferred to v0.5).**
-   The reviewer argued strongly that long-running queries are *the*
-   reason to use this subpath, and shipping without cancellation
-   means abandoned Promises leak worker work with no recourse.
-   They're right. But the implementation needs:
-     - `duckdb_interrupt(duckdb_connection)` FFI binding (one line)
-     - A `cancel` protocol op that takes a request `id` and maps it
-       to the connId for `duckdb_interrupt`
-     - Coordination with iterators (interrupting mid-`iterNext`
-       must terminate the iterator cleanly, not just return one
-       erroring chunk)
-     - Coordination with transactions (interrupting mid-callback
-       must trigger ROLLBACK + reject the user's `db.transaction`
-       promise)
-     - Tests covering signal abort before send, mid-flight, and
-       after completion (no-op).
-   That's ~half a day on top of the existing 1–2 day budget. **v0.4.0
-   ships without cancellation; v0.5.0 adds it as the headline
-   feature** (alongside Windows, the previously-planned v0.5).
-   Document the limitation prominently in v0.4.0 README so users
-   building HTTP servers know to reach for a timeout pattern (or
-   wait for v0.5).
+5. **`AbortSignal` / cancellation — RESOLVED (v0.5 with revised
+   architecture; v0.4.0 shipped without).** v0.5.0 adds it as the
+   headline feature; Windows slides to v0.6.0. **The "half-day"
+   scope estimate in this RFC's first draft was wrong** — a post-v0.4
+   spike (2026-05-15) proved the original implicit architecture
+   ("worker handles a `cancel` postMessage") cannot work, because
+   the worker's JS event loop is **completely blocked** during a
+   DuckDB FFI call. Concrete data:
+
+   ```
+   Spike 1 — same-worker cancel:
+     Worker started query at  +58ms
+     Main sent cancel at     +158ms
+     Worker received cancel  +769ms   ← only after query finished
+     Cancel latency 611ms (worker frozen during 711ms FFI block)
+   ```
+
+   The viable architecture (proven by Spike 2): the **main thread
+   calls `duckdb_interrupt(connHandle)` directly** while the worker
+   is blocked. This works because `libduckdb` is loaded once per
+   process; the connection pointer is just a memory address that's
+   valid in both threads; DuckDB documents `duckdb_interrupt` as
+   safe to call from another thread.
+
+   ```
+   Spike 2 — main-thread interrupt on worker-owned handle:
+     Worker started query at  +44ms
+     Main called duckdb_interrupt(handle) directly at +145ms
+     Worker queryEnd at      +147ms  with err="INTERRUPT Error: Interrupted!"
+     Interrupt latency: 2ms
+   ```
+
+   The v0.4.1 patch ships **forward-compat plumbing** for this
+   architecture without exposing any new public API:
+   - Worker's `connect`/`txnBegin` responses include `interruptHandle:
+     bigint` (the raw `duckdb_connection` pointer) and
+     `interruptGeneration: number` (monotonic, prevents stale abort
+     listeners firing on a recycled connId).
+   - Main proxy stores these in `AsyncDatabase._interruptHandles:
+     Map<connId, { ptr, generation }>` but never reads them.
+   - The map is cleared on every `Connection.close()` and
+     `Database.close()`.
+
+   v0.5 wiring (still to ship):
+   - Main thread dlopens just `duckdb_interrupt` (libduckdb is already
+     loaded by the sync subpath; reuse same library path).
+   - Every async query method accepts `{ signal: AbortSignal }`.
+   - **Critical correctness invariant** (per GPT-5.5 review): only
+     interrupt when the aborted request is **known to be active** on
+     its target connection. Worker emits a `requestActive` event
+     immediately before entering blocking FFI; main tracks
+     `activeRequestByConn: Map<connId, requestId>`. Without this,
+     aborting a queued request would interrupt a different request
+     that's currently active — a correctness bug.
+   - New error class: `DuckDBAbortError extends DuckDBError`.
+   - Iterator coordination: aborting mid-`iterNext` interrupts the
+     active fetch; in-flight prefetch is drained; `iterReturn` is
+     sent best-effort. Aborting between chunks (when no FFI is
+     active) marks the iterator aborted and next `.next()` rejects.
+   - Transaction coordination: aborting a sub-op rejects with
+     `DuckDBAbortError`; `runTransaction`'s catch path sends
+     `txnRollback` **without** the user signal (cleanup must be
+     best-effort even after abort).
+   - **Sync subpath does NOT get `AbortSignal`** — sync FFI blocks
+     the JS thread that would receive the abort event; shipping a
+     signal that can't interrupt mid-FFI would be misleading.
+     Document that users needing cancellation use `duckdb-bun/async`;
+     `close({ timeout })` is the only fallback for the sync subpath
+     and is framed as a shutdown hammer, not equivalent to per-query
+     cancellation.
+
+   **Revised scope (per GPT-5.5):** 1.5–2 days minimum for correct
+   semantics; 2–3 days with full polish (main-side request scheduler
+   for prompt queued-cancel, transaction-level signal, stress tests).
 
 ---
 

@@ -4,6 +4,72 @@ All notable changes documented here. Versioning follows
 [semver](https://semver.org/) — `0.x` releases may make breaking changes
 between minor versions until the `1.0.0` API freeze.
 
+## 0.4.1 — 2026-05-15
+
+Patch release: forward-compat plumbing for v0.5 cancellation, iterator
+race tests, and documentation refinements. **No public API additions.**
+
+### Background
+
+After v0.4.0 shipped, a post-release GPT-5.5 fresh-review surfaced a
+critical question about how `AbortSignal` cancellation would actually
+work in the async subpath. A spike (captured in
+[`docs/rfcs/0001-worker-async-api.md` §16 #5](./docs/rfcs/0001-worker-async-api.md#16--open-questions--resolved-decisions))
+proved that the original "worker handles a `cancel` postMessage" plan
+is architecturally infeasible — the worker's JS event loop is
+**completely frozen** during a blocking DuckDB FFI call (cancel
+latency 611ms over a 711ms query, vs the desired ~0ms). A second
+spike confirmed the viable architecture: **the main thread calls
+`duckdb_interrupt(handle)` directly while the worker is blocked**;
+interrupt latency 2ms; DuckDB returns `"INTERRUPT Error: Interrupted!"`.
+
+v0.5.0 will ship that architecture. v0.4.1 lays the protocol
+groundwork now so v0.5's wire format is a strict superset.
+
+### Added (forward-compat only)
+
+- **`AsyncDatabase._interruptHandles: Map<connId, { ptr, generation }>`** —
+  the worker now sends the raw `duckdb_connection` pointer (as
+  `BigInt`) plus a monotonic `interruptGeneration` token on every
+  `connect` and `txnBegin` response. The main proxy caches them but
+  **does not use them in v0.4.1**. v0.5 will wire them into
+  `mainLib.duckdb_interrupt(ptr)` on `AbortSignal.abort`. The
+  generation token lets v0.5 detect stale abort listeners that fire
+  after a connId has been reused.
+- Handles are cleared from `_interruptHandles` on `Connection.close()`
+  and `Database.close()` so late aborts (v0.5) can't fire on freed
+  connections.
+
+### Tests
+
+- 5 new forward-compat tests pinning the interrupt-handle plumbing:
+  presence after `connect()` and `transaction()`, fresh generation
+  per connection, cleanup on `Connection.close()` and
+  `Database.close()`.
+- 3 new iterator-race tests covering the `prefetch > 0` scenarios
+  GPT-5.5 flagged: `break` mid-prefetch, `throw` mid-prefetch, and
+  immediate `.return()` after first `.next()` while prefetched
+  chunks are still in flight. All verify the connection stays
+  usable for subsequent ops.
+- Total: 186 tests (was 178).
+
+### Documentation
+
+- **README** now has a "Cancellation note" inline with the async
+  example explaining: v0.4.x has no `AbortSignal`; `close({ timeout })`
+  is the only fallback and is a *shutdown hammer*, not a per-request
+  primitive; v0.5 will add `AbortSignal` to the async subpath only;
+  the sync `duckdb-bun` API will **never** get `AbortSignal` (sync
+  FFI blocks the JS thread that would receive the event).
+- **`docs/rfcs/0001-worker-async-api.md` §16 #5** rewritten with
+  spike data, the revised architecture, the GPT-5.5-flagged
+  correctness invariant (only call `duckdb_interrupt` when the
+  aborted request is known to be active on its target connection —
+  otherwise you cancel the wrong query), and the revised scope
+  estimate (1.5–3 days, not "half a day").
+- **HANDOFF.md** updated with v0.4.0 ship, v0.4.1 ship, the spike
+  findings, and the revised v0.5/v0.6 roadmap.
+
 ## 0.4.0 — 2026-05-15
 
 Adds the `duckdb-bun/async` subpath — same API surface as the main

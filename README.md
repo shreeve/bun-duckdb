@@ -82,6 +82,17 @@ clearInterval(t);
 
 See [`examples/async.mjs`](./examples/async.mjs) for the full surface.
 
+> **Cancellation note (v0.4.x):** `AbortSignal` per-query cancellation
+> is planned for v0.5.0 on the async subpath only — a post-v0.4 spike
+> proved the architecture (`main thread calls duckdb_interrupt` on the
+> worker's connection handle while the worker is blocked in FFI;
+> interrupt latency ~2ms). Until v0.5, the safety valve for hung
+> queries is `db.close({ timeout: ms })`, which terminates the whole
+> Worker — not a per-request primitive. The synchronous `duckdb-bun`
+> API won't get `AbortSignal` even after v0.5 (sync FFI blocks the JS
+> thread that would receive the event); use `duckdb-bun/async` if you
+> need cancellation.
+
 ## Why
 
 ### Which package should I use?

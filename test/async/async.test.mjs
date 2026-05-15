@@ -523,6 +523,128 @@ d('Error reconstruction', () => {
 // Type round-trip (BLOB, BigInt, Date)
 // ============================================================================
 
+// ============================================================================
+// Forward-compat for v0.5 cancellation (v0.4.1+)
+// ============================================================================
+//
+// The worker now sends `interruptHandle` (raw duckdb_connection BigInt)
+// and `interruptGeneration` on every `connect` / `txnBegin` response.
+// The main proxy caches these in `_interruptHandles` keyed by connId.
+// v0.4.1 doesn't USE the handles; v0.5 will plug them into a main-
+// thread `duckdb_interrupt` path for AbortSignal cancellation.
+//
+// These tests pin the plumbing so v0.5's implementation can rely on
+// the contract.
+
+d('v0.4.1 forward-compat: interrupt handle plumbing', () => {
+  test('explicit connect() populates _interruptHandles', async () => {
+    await using db = open(':memory:');
+    using conn = db.connect();
+    await conn.get('SELECT 1');   // forces lazy connect
+    const handle = db._interruptHandles.get(conn.id);
+    expect(handle).toBeDefined();
+    expect(typeof handle.ptr).toBe('bigint');
+    expect(typeof handle.generation).toBe('number');
+    expect(handle.generation).toBeGreaterThan(0);
+  });
+
+  test('each connection gets a fresh generation token', async () => {
+    await using db = open(':memory:');
+    const a = db.connect(); await a.get('SELECT 1');
+    const b = db.connect(); await b.get('SELECT 1');
+    const ga = db._interruptHandles.get(a.id).generation;
+    const gb = db._interruptHandles.get(b.id).generation;
+    expect(gb).toBeGreaterThan(ga);
+    await a.close(); await b.close();
+  });
+
+  test('conn.close() removes the cached interrupt handle', async () => {
+    await using db = open(':memory:');
+    const conn = db.connect();
+    await conn.get('SELECT 1');
+    const connId = conn.id;
+    expect(db._interruptHandles.get(connId)).toBeDefined();
+    await conn.close();
+    expect(db._interruptHandles.get(connId)).toBeUndefined();
+  });
+
+  test('db.close() clears all cached interrupt handles', async () => {
+    const db = open(':memory:');
+    const a = db.connect(); await a.get('SELECT 1');
+    const b = db.connect(); await b.get('SELECT 1');
+    expect(db._interruptHandles.size).toBeGreaterThan(0);
+    await db.close();
+    expect(db._interruptHandles.size).toBe(0);
+  });
+
+  test('transaction connection also reports an interrupt handle', async () => {
+    await using db = open(':memory:');
+    let seenHandle;
+    await db.transaction(async (tx) => {
+      // tx.id is the txnConnId; handle should be cached
+      seenHandle = db._interruptHandles.get(tx.id);
+      await tx.exec('SELECT 1');
+    });
+    expect(seenHandle).toBeDefined();
+    expect(typeof seenHandle.ptr).toBe('bigint');
+  });
+});
+
+// ============================================================================
+// Iterator race conditions (v0.4.1 additions)
+// ============================================================================
+
+d('Iterator races', () => {
+  test('break with prefetch in flight: connection still usable', async () => {
+    await using db = open(':memory:');
+    await db.exec('CREATE TABLE t (n INT)');
+    using conn = db.connect();
+    await conn.append('t', ['n'], Array.from({ length: 10000 }, (_, i) => [i]));
+    using stmt = await conn.prepare('SELECT * FROM t ORDER BY n');
+    let count = 0;
+    for await (const _r of stmt.iterate([], { prefetch: 4 })) {
+      if (++count >= 2) break;
+    }
+    // The prefetched chunks may still be in flight when we break;
+    // cleanup must drain them. Subsequent op must succeed.
+    const c = await conn.get('SELECT COUNT(*) AS n FROM t');
+    expect(Number(c.n)).toBe(10000);
+  });
+
+  test('throw with prefetch in flight: connection still usable', async () => {
+    await using db = open(':memory:');
+    await db.exec('CREATE TABLE t (n INT)');
+    using conn = db.connect();
+    await conn.append('t', ['n'], Array.from({ length: 10000 }, (_, i) => [i]));
+    using stmt = await conn.prepare('SELECT * FROM t ORDER BY n');
+    let thrown;
+    try {
+      for await (const _r of stmt.iterate([], { prefetch: 4 })) {
+        throw new Error('break it');
+      }
+    } catch (e) { thrown = e; }
+    expect(thrown?.message).toBe('break it');
+    const c = await conn.get('SELECT COUNT(*) AS n FROM t');
+    expect(Number(c.n)).toBe(10000);
+  });
+
+  test('immediate .return() after first .next() drains prefetch', async () => {
+    await using db = open(':memory:');
+    await db.exec('CREATE TABLE t (n INT)');
+    using conn = db.connect();
+    await conn.append('t', ['n'], Array.from({ length: 5000 }, (_, i) => [i]));
+    using stmt = await conn.prepare('SELECT * FROM t ORDER BY n');
+    const it = stmt.iterate([], { prefetch: 2 });
+    await it.next();        // chunk 1 returned; chunks 2..3 prefetched
+    await it.return();      // must drain in-flight prefetch, send iterReturn
+    // Reuse stmt
+    const it2 = stmt.iterate();
+    const first = await it2.next();
+    expect(first.value.n).toBe(0);
+    await it2.return();
+  });
+});
+
 d('Async type round-trip', () => {
   test('BLOB Uint8Array round-trips through structuredClone', async () => {
     await using db = open(':memory:');

@@ -100,7 +100,29 @@ export type TargetKind = Target['kind'];
 // ============================================================================
 
 export interface OpenResult   { dbId: number }
-export interface ConnectResult { connId: number }
+
+/**
+ * Reply to a `connect` / `txnBegin` request.
+ *
+ * `interruptHandle` is the raw `duckdb_connection` pointer (cast to
+ * `BigInt`). It's reserved for v0.5 cancellation: the main thread will
+ * dlopen `duckdb_interrupt` and call it with this handle to abort an
+ * in-flight query while the worker is blocked in FFI. The handle is
+ * never dereferenced from JavaScript on the main thread.
+ *
+ * `interruptGeneration` is a monotonic token that lets the main thread
+ * invalidate stale references — if a `connId` is recycled after
+ * `close()`, the new generation prevents an old `AbortSignal` from
+ * firing `duckdb_interrupt` on the recycled connection.
+ *
+ * Both fields are optional for back-compat with v0.4.0 servers, where
+ * they were not sent. v0.4.1+ workers always include them.
+ */
+export interface ConnectResult {
+  connId: number;
+  interruptHandle?: bigint;
+  interruptGeneration?: number;
+}
 export interface PrepareResult { stmtId: number }
 export interface IterStartResult {
   iterId: number;
@@ -116,7 +138,12 @@ export interface IterNextResult<T extends Row = Row> {
 export interface AppendCreateResult { appId: number }
 export interface AppendRowsResult   { rows: number }
 export interface AppendFlushResult  { rows: number }
-export interface TxnBeginResult     { connId: number }
+export interface TxnBeginResult {
+  connId: number;
+  /** See ConnectResult.interruptHandle (forward-compat for v0.5). */
+  interruptHandle?: bigint;
+  interruptGeneration?: number;
+}
 
 /** What the worker sends back for any `close`/`release`/`appendFlush`/`commit`/`rollback`. */
 export type OkResult = { ok: true };
