@@ -4,6 +4,41 @@ All notable changes documented here. Versioning follows
 [semver](https://semver.org/) — `0.x` releases may make breaking changes
 between minor versions until the `1.0.0` API freeze.
 
+## 0.2.1 — 2026-05-14
+
+Install-friction patch. Pre-built shim binaries now ship in the npm
+tarball for Linux x64 / Linux arm64 / macOS x64 / macOS arm64 — no
+`make` step required after `bun add bun-duckdb`.
+
+### Added
+
+- Pre-built `lib/libduckdb-shim-{linux,darwin}-{x64,arm64}.{so,dylib}`
+  bundled into the published package. Built per-platform by the new
+  release workflow before publish.
+- `.github/workflows/test.yml` expanded to a 4-platform matrix:
+  Linux x64, Linux arm64 (free GitHub ARM runners), macOS x64,
+  macOS arm64. Builds the shim, runs the test suite, smokes all
+  three examples on every push.
+- `.github/workflows/release.yml`: on tag push (`v*`), builds shims
+  on all four platforms, bundles them, runs `npm publish` (if
+  `NPM_TOKEN` secret is set), and creates a GitHub release with
+  the tarball as an asset.
+- `lib/Makefile` accepts `TAGGED=1` for platform-tagged output
+  (e.g. `libduckdb-shim-linux-x64.so`); CI uses this to produce
+  the artifacts that get bundled.
+
+### Changed
+
+- `findShimLibrary()` lookup priority updated to prefer the
+  platform-tagged shim that ships in the package, with fallbacks
+  for source-clone users (`make -C lib`) and historical install
+  locations.
+
+### Internal
+
+- 13 files changed in the previous release polish; this patch is
+  install-experience only — no public API change.
+
 ## 0.2.0 — 2026-05-14
 
 First substantive release. v0.1 was a minimal extracted FFI binding;

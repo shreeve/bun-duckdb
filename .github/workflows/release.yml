@@ -1,0 +1,139 @@
+name: release
+
+# Triggers on tag push (v0.2.1, v0.3.0, etc.). Builds the FFI shim on
+# all four supported platforms, bundles the shims into the package, and
+# publishes to npm. Falls back to creating a GitHub release with the
+# tarball as an asset if NPM_TOKEN is not configured.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  DUCKDB_VERSION: v1.5.2
+
+jobs:
+  build-shim:
+    name: build-shim ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x64
+            os: ubuntu-latest
+            duckdb_asset: libduckdb-linux-amd64.zip
+            shim_artifact: libduckdb-shim-linux-x64.so
+          - label: linux-arm64
+            os: ubuntu-24.04-arm
+            duckdb_asset: libduckdb-linux-arm64.zip
+            shim_artifact: libduckdb-shim-linux-arm64.so
+          - label: darwin-x64
+            os: macos-13
+            duckdb_asset: libduckdb-osx-universal.zip
+            shim_artifact: libduckdb-shim-darwin-x64.dylib
+          - label: darwin-arm64
+            os: macos-latest
+            duckdb_asset: libduckdb-osx-universal.zip
+            shim_artifact: libduckdb-shim-darwin-arm64.dylib
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libduckdb (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          curl -fsSL -o libduckdb.zip \
+            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/${{ matrix.duckdb_asset }}"
+          unzip -q libduckdb.zip -d libduckdb
+          sudo cp libduckdb/libduckdb.so /usr/local/lib/
+          sudo cp libduckdb/duckdb.h     /usr/local/include/ || true
+          sudo ldconfig
+
+      - name: Install libduckdb (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          curl -fsSL -o libduckdb.zip \
+            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/${{ matrix.duckdb_asset }}"
+          unzip -q libduckdb.zip -d libduckdb
+          sudo cp libduckdb/libduckdb.dylib /usr/local/lib/
+
+      - name: Build platform-tagged FFI shim
+        run: make -C lib TAGGED=1
+
+      - name: Upload shim artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.shim_artifact }}
+          path: lib/${{ matrix.shim_artifact }}
+          retention-days: 1
+
+  publish:
+    needs: build-shim
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to create the GitHub release
+      id-token: write   # for npm provenance (optional but recommended)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Setup Node (for npm publish)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Pull all four platform shims into lib/ before bundling.
+      - name: Download shim artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: lib-shims
+
+      - name: Stage shims into lib/
+        run: |
+          set -euo pipefail
+          cp lib-shims/libduckdb-shim-linux-x64.so/libduckdb-shim-linux-x64.so   lib/
+          cp lib-shims/libduckdb-shim-linux-arm64.so/libduckdb-shim-linux-arm64.so lib/
+          cp lib-shims/libduckdb-shim-darwin-x64.dylib/libduckdb-shim-darwin-x64.dylib lib/
+          cp lib-shims/libduckdb-shim-darwin-arm64.dylib/libduckdb-shim-darwin-arm64.dylib lib/
+          ls -lh lib/libduckdb-shim-*
+
+      - name: Verify package version matches tag
+        run: |
+          set -euo pipefail
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          TAG_VERSION=${GITHUB_REF_NAME#v}
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::package.json version ($PKG_VERSION) does not match tag ($TAG_VERSION)"
+            exit 1
+          fi
+          echo "Publishing version $PKG_VERSION"
+
+      - name: Pack tarball (for the GitHub release artifact)
+        run: npm pack
+
+      - name: Publish to npm (skipped if NPM_TOKEN secret is not set)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::warning::NPM_TOKEN secret is not set — skipping npm publish."
+            echo "Set NPM_TOKEN under repo Settings → Secrets → Actions to enable auto-publish."
+            echo "The GitHub release with the tarball is still being created below."
+            exit 0
+          fi
+          npm publish --access public --provenance
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            *.tgz

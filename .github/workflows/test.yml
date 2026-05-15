@@ -6,16 +6,34 @@ on:
   pull_request:
     branches: [main]
 
+# Pin DuckDB version in one place — bump as we adopt newer releases.
+env:
+  DUCKDB_VERSION: v1.5.2
+
 jobs:
   test:
-    name: ${{ matrix.os }} (${{ matrix.duckdb }})
+    name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        # Pin a specific DuckDB release; bump as we adopt newer versions.
-        duckdb: ['v1.5.2']
+        include:
+          - label: linux-x64
+            os: ubuntu-latest
+            duckdb_asset: libduckdb-linux-amd64.zip
+            shim_artifact: libduckdb-shim-linux-x64.so
+          - label: linux-arm64
+            os: ubuntu-24.04-arm
+            duckdb_asset: libduckdb-linux-arm64.zip
+            shim_artifact: libduckdb-shim-linux-arm64.so
+          - label: darwin-x64
+            os: macos-13
+            duckdb_asset: libduckdb-osx-universal.zip
+            shim_artifact: libduckdb-shim-darwin-x64.dylib
+          - label: darwin-arm64
+            os: macos-latest
+            duckdb_asset: libduckdb-osx-universal.zip
+            shim_artifact: libduckdb-shim-darwin-arm64.dylib
     steps:
       - uses: actions/checkout@v4
 
@@ -24,16 +42,12 @@ jobs:
         with:
           bun-version: latest
 
-      # ----- libduckdb install ------------------------------------------------
-
       - name: Install libduckdb (Linux)
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
-          DUCKDB_VER="${{ matrix.duckdb }}"
-          # GitHub release naming
           curl -fsSL -o libduckdb.zip \
-            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VER}/libduckdb-linux-amd64.zip"
+            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/${{ matrix.duckdb_asset }}"
           unzip -q libduckdb.zip -d libduckdb
           sudo cp libduckdb/libduckdb.so /usr/local/lib/
           sudo cp libduckdb/duckdb.h     /usr/local/include/ || true
@@ -43,27 +57,18 @@ jobs:
       - name: Install libduckdb (macOS)
         if: runner.os == 'macOS'
         run: |
-          # Homebrew has DuckDB; avoid the version mismatch by installing
-          # libduckdb directly from the GitHub release for consistency
-          # across the matrix.
           set -euo pipefail
-          DUCKDB_VER="${{ matrix.duckdb }}"
-          ARCH=$(uname -m)
-          case "$ARCH" in
-            arm64) ASSET="libduckdb-osx-universal.zip" ;;
-            x86_64) ASSET="libduckdb-osx-universal.zip" ;;
-            *) echo "unsupported arch: $ARCH"; exit 1 ;;
-          esac
           curl -fsSL -o libduckdb.zip \
-            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VER}/${ASSET}"
+            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/${{ matrix.duckdb_asset }}"
           unzip -q libduckdb.zip -d libduckdb
           sudo cp libduckdb/libduckdb.dylib /usr/local/lib/
           ls -lh /usr/local/lib/libduckdb.dylib
 
-      # ----- shim + tests -----------------------------------------------------
-
-      - name: Build FFI shim
-        run: make -C lib
+      - name: Build platform-tagged FFI shim
+        run: |
+          make -C lib TAGGED=1
+          make -C lib print-platform
+          ls -lh lib/${{ matrix.shim_artifact }}
 
       - name: Run tests
         run: bun test
@@ -73,3 +78,10 @@ jobs:
           bun examples/basic.mjs
           bun examples/prepared.mjs
           bun examples/appender.mjs
+
+      - name: Upload shim artifact (consumed by release.yml on tag pushes)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.shim_artifact }}
+          path: lib/${{ matrix.shim_artifact }}
+          retention-days: 7

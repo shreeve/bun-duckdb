@@ -12,32 +12,65 @@
 # conditional code paths in JS.
 #
 # Usage:
-#   make            # builds libduckdb-shim for the current platform
-#   make clean      # removes built artifacts
+#   make                       # builds untagged libduckdb-shim.{so,dylib}
+#                              # (what local contributors get)
 #
-# Output goes next to libduckdb (so the runtime finds it via the same
-# search paths). Override the install location with PREFIX:
+#   make TAGGED=1              # builds platform-tagged name like
+#                              # libduckdb-shim-linux-x64.so — what CI
+#                              # produces before bundling into the npm
+#                              # tarball
+#
+#   make clean                 # removes built artifacts
+#
+# Override the install location with PREFIX:
 #   make install PREFIX=/opt/local
 
 UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+
+# Map uname output to Bun's process.platform / process.arch values so the
+# tagged filename matches what findShimLibrary() looks for at runtime.
 
 ifeq ($(UNAME_S),Linux)
-  SHIM := libduckdb-shim.so
-  CFLAGS_PIC := -fPIC
+  PLATFORM       := linux
+  EXT            := so
+  CFLAGS_PIC     := -fPIC
   LDFLAGS_SHARED := -shared
 endif
 
 ifeq ($(UNAME_S),Darwin)
-  SHIM := libduckdb-shim.dylib
-  CFLAGS_PIC := -fPIC
+  PLATFORM       := darwin
+  EXT            := dylib
+  CFLAGS_PIC     := -fPIC
   LDFLAGS_SHARED := -dynamiclib
 endif
 
-CC ?= gcc
-CFLAGS ?= -O2 -Wall -Wextra
-LIBDUCKDB ?= -lduckdb
+# uname -m varies: x86_64 / amd64 → x64, aarch64 / arm64 → arm64
+ARCH := $(strip $(if $(filter x86_64 amd64,$(UNAME_M)),x64,$(if $(filter aarch64 arm64,$(UNAME_M)),arm64,unknown)))
 
-PREFIX ?= /usr/local
+# `make TAGGED=1` → platform-tagged output (CI). Otherwise → untagged (dev).
+ifeq ($(strip $(TAGGED)),1)
+  SHIM := libduckdb-shim-$(PLATFORM)-$(ARCH).$(EXT)
+else
+  SHIM := libduckdb-shim.$(EXT)
+endif
+
+CC        ?= gcc
+CFLAGS    ?= -O2 -Wall -Wextra
+PREFIX    ?= /usr/local
+
+# Auto-detect a Homebrew libduckdb on macOS so contributors don't have to
+# set LIBDUCKDB manually. Homebrew on Apple Silicon installs into
+# /opt/homebrew/{lib,include}; on Intel macOS into /usr/local/{lib,include}
+# (which is already on the default search path).
+ifeq ($(PLATFORM),darwin)
+  ifneq ($(wildcard /opt/homebrew/lib/libduckdb.dylib),)
+    LIBDUCKDB ?= -L/opt/homebrew/lib -lduckdb
+    CFLAGS    += -I/opt/homebrew/include
+  endif
+endif
+
+LIBDUCKDB ?= -lduckdb
 
 all: $(SHIM)
 
@@ -49,6 +82,10 @@ install: $(SHIM)
 	install -m 0755 $(SHIM) $(PREFIX)/lib/
 
 clean:
-	rm -f libduckdb-shim.so libduckdb-shim.dylib *.o
+	rm -f libduckdb-shim.so libduckdb-shim.dylib \
+	      libduckdb-shim-*.so libduckdb-shim-*.dylib *.o
 
-.PHONY: all install clean
+print-platform:
+	@echo "PLATFORM=$(PLATFORM) ARCH=$(ARCH) EXT=$(EXT) SHIM=$(SHIM)"
+
+.PHONY: all install clean print-platform

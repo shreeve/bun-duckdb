@@ -1,6 +1,6 @@
 {
   "name": "bun-duckdb",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Efficient DuckDB driver for Bun, using pure FFI",
   "type": "module",
   "sideEffects": false,
@@ -18,6 +18,10 @@
     "lib/duckdb.d.ts",
     "lib/duckdb-shim.c",
     "lib/Makefile",
+    "lib/libduckdb-shim-linux-x64.so",
+    "lib/libduckdb-shim-linux-arm64.so",
+    "lib/libduckdb-shim-darwin-x64.dylib",
+    "lib/libduckdb-shim-darwin-arm64.dylib",
     "README.md",
     "AGENTS.md",
     "CHANGELOG.md",

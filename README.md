@@ -137,42 +137,46 @@ sudo dnf install libduckdb
 #   https://github.com/duckdb/duckdb/releases
 ```
 
-### FFI shim — when you need it
+### FFI shim — what's it for
 
-The driver ships with one tiny C source file (`lib/duckdb-shim.c`,
-~30 lines) that wraps three DuckDB functions which take a 48-byte
-struct by value — something Bun's FFI can't currently do directly on
-Linux x86_64. See [AGENTS.md § FFI Bug 2](./AGENTS.md#bug-2-struct-by-value-passing-is-impossible)
-for the gory details.
+The driver depends on one tiny C wrapper (`lib/duckdb-shim.c`, ~30
+lines) around three DuckDB functions that take a 48-byte struct by
+value — something Bun's FFI can't currently do directly on most
+platforms. See [AGENTS.md § FFI Bug 2](./AGENTS.md#bug-2-struct-by-value-passing-is-impossible)
+for details.
 
-| Platform | Shim required? | What to do |
-|---|---|---|
-| **Linux x86_64** | **Yes** | Build & install the shim once (see below) |
-| **Linux arm64** | Recommended | Same as above (the AArch64 ABI is friendlier but having the shim is safer) |
-| **macOS arm64 (Apple Silicon)** | No (works without) | The driver falls back to a direct call. Building the shim still works if you'd rather use that path. |
-| **macOS x86_64 (Intel)** | Recommended | Same as Linux x86_64 |
-| **Windows x86_64** | Untested in v0.2 — let us know if you try it |
+**For npm users (the common case):** the shim is **pre-built and
+shipped in the package** for the four major platforms. `bun add
+bun-duckdb` is everything you need to install — no `make` step, no
+toolchain dependency.
 
-To build:
+| Platform | Shim shipped? |
+|---|---|
+| **Linux x86_64** | ✅ `lib/libduckdb-shim-linux-x64.so` |
+| **Linux arm64** | ✅ `lib/libduckdb-shim-linux-arm64.so` |
+| **macOS arm64 (Apple Silicon)** | ✅ `lib/libduckdb-shim-darwin-arm64.dylib` (also has a non-shim fallback that works on this platform) |
+| **macOS x86_64 (Intel)** | ✅ `lib/libduckdb-shim-darwin-x64.dylib` |
+| **Windows x86_64** | ⚠ Not yet — let us know if you try it |
+
+The pre-built shims are produced per-platform by the [release
+workflow](./.github/workflows/release.yml) and bundled into the npm
+tarball before publish.
+
+**For source-clone / contributor use:** build a local untagged shim
+once with the included Makefile.
 
 ```bash
-# Inside an installed package
-cd node_modules/bun-duckdb/lib
-make                              # → libduckdb-shim.so (Linux) or .dylib (macOS)
-sudo make install                 # optional: → /usr/local/lib/
-
 # In a clone of the repo
-make -C lib
+make -C lib                       # → lib/libduckdb-shim.{so,dylib}
+
+# Or platform-tagged (matches what CI ships):
+make -C lib TAGGED=1              # → lib/libduckdb-shim-{platform}-{arch}.{so,dylib}
 ```
 
-Override the shim location with
-`DUCKDB_SHIM_PATH=/path/to/libduckdb-shim.so`. The driver searches a
-few standard locations automatically; setting the env var skips the
-search.
-
-> **Pre-built shim binaries** are tracked as a v0.3 deliverable so
-> that `bun add bun-duckdb` works without a `make` step on supported
-> platforms. For now, the build is one command and ~30 KB output.
+The driver's `findShimLibrary()` searches in priority order: the
+`$DUCKDB_SHIM_PATH` env override, then the platform-tagged shim,
+then the untagged shim, then any shim next to `libduckdb` itself.
+Override the search with `DUCKDB_SHIM_PATH=/path/to/libduckdb-shim.so`.
 
 ## Quick start
 
@@ -476,12 +480,17 @@ SQL casts: `'SELECT CAST(? AS UINTEGER)'`.
 - [x] Named error classes: `DuckDBError`, `DuckDBClosedError`,
       `DuckDBPrepareError`, `DuckDBTransactionError`
 
+### v0.2.1 — shipped
+
+- [x] **Pre-built shim binaries** for Linux x64 / Linux arm64 /
+      macOS x64 / macOS arm64 bundled into the npm tarball.
+      `bun add bun-duckdb` is now zero-friction install — no `make`
+      step required.
+- [x] CI runs the full test suite + smokes the examples on all four
+      platforms on every push.
+
 ### v0.3.0 — planned
 
-- [ ] **Pre-built shim binaries** shipped per-platform (or via
-      `optionalDependencies` à la esbuild) so `bun add bun-duckdb`
-      works on Linux x86_64 / arm64 / macOS x86_64 without a
-      `make` step
 - [ ] `Statement.iterate(params?)` returning `AsyncIterable<T>` for
       streaming large result sets without materialization
 - [ ] `conn.chunks(sql, params?)` exposing raw chunk iteration for
