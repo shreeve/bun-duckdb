@@ -1,6 +1,6 @@
 {
   "name": "duckdb-bun",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "Efficient DuckDB driver for Bun, using pure FFI",
   "type": "module",
   "sideEffects": false,
@@ -32,7 +32,8 @@
     "test": "bun test",
     "example:basic": "bun examples/basic.mjs",
     "example:prepared": "bun examples/prepared.mjs",
-    "example:appender": "bun examples/appender.mjs"
+    "example:appender": "bun examples/appender.mjs",
+    "example:iterate": "bun examples/iterate.mjs"
   },
   "keywords": [
     "duckdb",

@@ -245,14 +245,85 @@ The `readString(dataPtr, row)` helper handles both cases.
 
 ## Locking model
 
-Every public method on `Connection` that crosses the FFI boundary
-goes through `withLock(() => ...)`. This serializes concurrent calls
-into a single connection — DuckDB connections are not thread-safe in
-the JS-callback-during-FFI sense (Bun's loop can interleave promise
-microtasks during an FFI call's I/O).
+As of v0.3, each `Connection` owns its own `AsyncMutex` instance.
+(Pre-v0.3 the lock was process-global and lived as a module-level
+promise queue — that's gone.) Every public method on a `Connection`
+that crosses the FFI boundary goes through one of two patterns:
+
+```js
+// One-shot critical section (most queries)
+conn.withLock(() => {
+  if (this.#state !== 'open') throw new DuckDBClosedError('Connection');
+  // ... sync FFI here ...
+});
+
+// Lifetime lock (Statement.iterate's generator only)
+const release = await conn.acquireLock();
+try {
+  // ... can yield/await between FFI calls, lock is held ...
+} finally {
+  release();
+}
+```
+
+**Critical rule:** state checks belong **inside** `withLock`'s
+callback (not before queueing). `close()` can flip `#state` from
+`'open'` to `'closing'` while a query is waiting in the mutex queue.
+Checking state before queueing lets the query proceed; checking
+inside the callback rejects cleanly with `DuckDBClosedError`.
 
 For parallelism, create multiple `Connection`s via `db.connect()`.
-DuckDB supports many simultaneous connections to one database.
+DuckDB supports many simultaneous connections to one database. As of
+v0.3, sibling Connections execute concurrently (pre-v0.3 they all
+serialized through the global lock).
+
+### State machine
+
+`Database`, `Connection`, and `Statement` all carry a `#state` field:
+
+- `'open'`     — usable.
+- `'closing'`  — `close()` has been called; new ops abort with
+                `DuckDBClosedError` inside their lock callback.
+- `'closed'`   — FFI handles destroyed.
+
+The transition `'open' → 'closing'` happens **synchronously** at the
+top of `close()`. Public handle getters (`db.handle`, `conn.handle`,
+`stmt.closed`) reflect that synchronously so the v0.2-era contract
+`obj.close(); obj.handle === null` continues to hold without
+awaiting. The FFI destroy itself happens in the returned Promise.
+
+### Async close protocol
+
+`close()` is `async` on all three classes. Protocol:
+
+1. Set `#state = 'closing'`; null public handles synchronously.
+2. **Cancel active iterators first.** Each class tracks its in-flight
+   `Statement.iterate()` wrapper in `#activeIterator`. Calling
+   `await wrapper.return()` forces the paused generator to run its
+   `finally` (destroy result, destroy chunk, release lock).
+3. **Kick off `close()` on each child resource synchronously.** This
+   flips child `#state` to `'closing'` immediately (so
+   `stmt.closed === true` holds with the sync getter after a parent
+   `conn.close()` without awaiting). Capture the promises.
+4. **Await child closes** in the async tail.
+5. **Re-acquire the lock** (`await this.withLock(...)`). Any queries
+   queued behind the cancelled iterator wake up here, see `#state
+   === 'closing'` inside their callback, and reject cleanly with
+   `DuckDBClosedError` before any FFI call.
+6. Inside the lock: call `duckdb_disconnect` / `duckdb_close` /
+   `duckdb_destroy_prepare`. Set `#state = 'closed'`.
+
+The key invariant: **FFI destroy happens under the lock, not after
+it.** A naive "release iterator → destroy without lock" would race
+against any operations that queued behind the iterator and woke up
+when it released.
+
+Symbol semantics for `using`:
+
+| Pattern | Maps to |
+|---|---|
+| `using db = open(...)` (sync) | `Symbol.dispose` → `close().catch(...)` fire-and-forget. Best-effort. |
+| `await using db = open(...)` (preferred for streaming) | `Symbol.asyncDispose` → `await close()`. Full async cleanup. |
 
 ---
 

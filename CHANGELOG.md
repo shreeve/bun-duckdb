@@ -4,6 +4,105 @@ All notable changes documented here. Versioning follows
 [semver](https://semver.org/) — `0.x` releases may make breaking changes
 between minor versions until the `1.0.0` API freeze.
 
+## 0.3.0 — 2026-05-15
+
+Streaming results via `Statement.iterate()` — pull rows one at a time
+without materializing the full result set in memory. Also includes a
+foundational lock-model refactor (per-Connection locks; was process-
+global) that lets streams on one connection no longer block queries on
+sibling connections.
+
+### Added
+
+- **`Statement.iterate(params?)`** — async-iterable streaming of query
+  results. Holds the owning Connection's lock for the iterator's
+  lifetime; concurrent queries on the same Connection queue behind the
+  active iterator. For parallel streams, use multiple `db.connect()`s.
+  - Cooperative cancellation: `break`/throw inside `for await`, an
+    explicit `await it.return()`, or `await stmt.close()` /
+    `conn.close()` / `db.close()` all unblock the iterator promptly
+    and run the proper FFI destroy + lock-release in `finally`.
+  - Pre-start `.return()` is safe: abandoning the iterator before the
+    first `.next()` allocates no FFI handles and leaves the Statement
+    immediately reusable.
+  - Concurrent `.iterate()` on the same Statement throws `DuckDBError`
+    ("already iterating"); `.all()`/`.get()`/`.run()` on a Statement
+    with an active iterator likewise throws.
+- **`Connection.iterate(sql, params?)`** and **`Database.iterate(sql,
+  params?)`** — sugar that owns a temporary prepared Statement for the
+  iterator's lifetime. Prepares LAZILY on first `.next()`, so
+  abandoning the iterator without consuming it allocates no FFI
+  resources.
+- **`[Symbol.asyncDispose]`** on `Database`, `Connection`, and
+  `Statement`. For streaming code, prefer `await using db =
+  open(...)` — `Symbol.dispose` (sync) can't reliably wait for
+  iterator cleanup, so it's now a best-effort fire-and-forget that
+  routes through `close().catch(...)`.
+
+### Changed (soft-breaking — see "Migration" below)
+
+- **`Database.close()` / `Connection.close()` / `Statement.close()`
+  are now `async`.** The public handle/`closed` getters still flip
+  synchronously (so the v0.2 contract `obj.close(); obj.handle ===
+  null` continues to hold without `await`), but the FFI destroy
+  happens behind the returned Promise. Existing code using
+  `db.close()` without `await` continues to work; new streaming code
+  should `await close()` (or use `await using`) to be sure iterators
+  have finished cleanup before subsequent code runs.
+- **Connection lock is now per-Connection instead of process-global.**
+  Previously every FFI call across every Connection serialized through
+  one module-level promise queue, so two connections doing independent
+  queries ran sequentially. Now each Connection has its own
+  `AsyncMutex`; sibling connections execute concurrently. The new
+  test `Per-Connection lock parallelism > iterator on conn A does not
+  block queries on conn B` pins this behavior.
+- **Connection close protocol** (per a fresh-review pass with GPT-5.5):
+  `close()` first cancels any active iterator via `.return()` (so the
+  iterator's `finally` releases the lock), then *re-acquires* the lock
+  to perform `duckdb_disconnect` — under the lock, not after it. Any
+  queries queued behind the iterator wake up inside their own
+  withLock callback, see `state === 'closing'`, and abort with
+  `DuckDBClosedError` before any FFI call. This eliminates a race
+  HANDOFF.md's earlier sketch left under-specified.
+
+### Migration from v0.2.x to v0.3
+
+| If you were doing… | Still works? | Recommended for v0.3 |
+|---|---|---|
+| `db.close()` (no await) | Yes — handle nulls sync | Add `await` if downstream code expects FFI cleanup done |
+| `using db = open(...)` | Yes — best-effort | `await using db = open(...)` for full async cleanup |
+| Materializing queries (`db.all/get/run`) | Yes, unchanged | Switch to `db.iterate(sql)` for large result sets |
+
+### Internal
+
+- New `AsyncMutex` class with two APIs: `withLock(fn)` for one-shot
+  critical sections (replaces the old module-level `withLock`) and
+  `acquire()` for lifetime locks (used by `iterate()`'s generator,
+  which holds the lock across `yield` points).
+- `Connection`/`Database`/`Statement` now carry a state machine
+  (`'open' | 'closing' | 'closed'`) so callbacks queued behind a
+  cancelling iterator can recheck state inside their own critical
+  section and abort cleanly.
+- `Connection.#extractChunks()` refactored into reusable helpers
+  `_decodeColumnsMetadata(resultBuf)` and `_decodeChunkRows(chunk,
+  cols)` — both the materializing path (`.all()`) and the streaming
+  path (`.iterate()`) now share one column-decoder and one row-
+  decoder implementation.
+
+### Tests
+
+- New `test/iterate.test.mjs` — 22 tests covering happy paths
+  (in-order yield, parameter binding, chunk-boundary spanning, mixed
+  null/blob row decoding), cleanup on early break / throw / explicit
+  `.return()` / pre-start `.return()`, concurrency guards (second
+  iterate throws, `.all()` during iterate throws), close coordination
+  (`stmt.close()`/`conn.close()`/`db.close()` mid-iteration all
+  resolve a paused `.next()` as `{ done: true }`), the sugar APIs,
+  closed-state checks, and a stress loop (1000 short iterators).
+- New `Per-Connection lock parallelism` test pinning the lock-model
+  refactor.
+- 134 total tests now passing (was 112).
+
 ## 0.2.3 — 2026-05-15
 
 Intel-Mac (`darwin-x64`) shim now ships in the tarball, completing

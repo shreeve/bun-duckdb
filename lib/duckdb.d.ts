@@ -1,8 +1,12 @@
-// TypeScript declarations for duckdb-bun v0.2
+// TypeScript declarations for duckdb-bun v0.3
 //
 // Hand-written. Mirrors lib/duckdb.mjs's runtime API. Generic parameters
 // let users tighten row shapes when they know them; defaults are loose
 // (Record<string, unknown>) for ad-hoc queries.
+//
+// v0.3 additions: Statement.iterate(), Connection.iterate(),
+// Database.iterate(), [Symbol.asyncDispose] on Database/Connection/
+// Statement, and async close() (soft breaking change — see CHANGELOG).
 
 // ============================================================================
 // Type system
@@ -143,19 +147,42 @@ export class Database {
   prepare<T extends Row = Row>(sql: string): Promise<Statement<T>>;
 
   /**
+   * Stream rows from an SQL query. Sugar around prepare(sql).iterate(params)
+   * that owns the temporary Statement's lifecycle. Prepares LAZILY on first
+   * `.next()`, so abandoning the iterator allocates no FFI resources.
+   * (v0.3+)
+   */
+  iterate<T extends Row = Row>(sql: string, params?: Params): AsyncIterableIterator<T>;
+
+  /**
    * Run fn() inside a transaction. BEGIN before, COMMIT after success,
    * ROLLBACK + rethrow on any throw. fn receives the underlying Connection.
    *
    * Nested transactions throw DuckDBTransactionError in v0.2 (planned for
-   * v0.3 via SAVEPOINT).
+   * v0.3+ via SAVEPOINT).
    */
   transaction<R>(fn: (tx: Connection) => Promise<R>): Promise<R>;
 
-  /** Close the database. Idempotent. Also closes the lazy implicit Connection. */
-  close(): void;
+  /**
+   * Close the database. Idempotent.
+   *
+   * v0.3 made this async to coordinate with active iterators on child
+   * Connections. Callers using `db.close()` without await will still work
+   * (the public handle nulls out synchronously, matching v0.2 semantics),
+   * but the FFI destroy happens in the returned Promise. For streaming
+   * users, prefer `await using db = open(...)`.
+   */
+  close(): Promise<void>;
 
-  /** Symbol.dispose for `using db = open(...)` syntax. */
+  /**
+   * Symbol.dispose for `using db = open(...)` syntax. Fires close() with
+   * .catch() so the dispose can't throw an unhandled rejection. Best-effort
+   * fallback; for streaming code prefer `await using` (Symbol.asyncDispose).
+   */
   [Symbol.dispose](): void;
+
+  /** Symbol.asyncDispose for `await using db = open(...)`. Awaits close(). */
+  [Symbol.asyncDispose](): Promise<void>;
 }
 
 // ============================================================================
@@ -200,14 +227,29 @@ export class Connection {
   /** Prepare a statement for repeated execution. Caller must close() the Statement. */
   prepare<T extends Row = Row>(sql: string): Promise<Statement<T>>;
 
+  /**
+   * Stream rows from an SQL query. Sugar that owns its temporary Statement;
+   * prepares LAZILY on first `.next()`. (v0.3+)
+   */
+  iterate<T extends Row = Row>(sql: string, params?: Params): AsyncIterableIterator<T>;
+
   /** Run fn() inside a transaction. See Database.transaction for semantics. */
   transaction<R>(fn: (tx: Connection) => Promise<R>): Promise<R>;
 
-  /** Close the connection. Idempotent. */
-  close(): void;
+  /**
+   * Close the connection. Async as of v0.3 — cancels any active iterator
+   * (via wrapper.return()), waits for child Statements to close, then
+   * disconnects. The public handle nulls out synchronously, so the
+   * `conn.close(); conn.handle === null` contract still holds without
+   * awaiting.
+   */
+  close(): Promise<void>;
 
-  /** Symbol.dispose for `using conn = db.connect()` syntax. */
+  /** Symbol.dispose for `using conn = db.connect()` syntax. Fire-and-forget close(). */
   [Symbol.dispose](): void;
+
+  /** Symbol.asyncDispose for `await using conn = db.connect()`. Awaits close(). */
+  [Symbol.asyncDispose](): Promise<void>;
 }
 
 // ============================================================================
@@ -236,11 +278,34 @@ export class Statement<T extends Row = Row> {
   /** Execute for side effects. Returns rowsChanged. */
   run(params?: Params): Promise<RunResult>;
 
-  /** Free the prepared statement handle. Idempotent. */
-  close(): void;
+  /**
+   * Stream rows one at a time without materializing the full result set
+   * in memory. Holds the owning Connection's lock for the iterator's
+   * entire lifetime — concurrent queries on the same Connection queue
+   * behind it. Use `db.connect()` for parallel streams.
+   *
+   * The returned `AsyncIterableIterator` MUST be either consumed via
+   * `for await ... of` (which calls `.return()` on `break`/throw), or
+   * disposed explicitly via `await it.return()`. A paused-and-abandoned
+   * iterator holds the lock until garbage collection (or `close()`).
+   *
+   * Concurrent `.iterate()` on the same Statement throws DuckDBError;
+   * iterate on a closed Statement/Connection throws DuckDBClosedError.
+   * (v0.3+)
+   */
+  iterate(params?: Params): AsyncIterableIterator<T>;
 
-  /** Symbol.dispose for `using stmt = await db.prepare(...)` syntax. */
+  /**
+   * Free the prepared statement handle. Idempotent. Async as of v0.3 —
+   * cancels any active iterator before destroy.
+   */
+  close(): Promise<void>;
+
+  /** Symbol.dispose for `using stmt = ...`. Fire-and-forget close(). */
   [Symbol.dispose](): void;
+
+  /** Symbol.asyncDispose for `await using stmt = ...`. Awaits close(). */
+  [Symbol.asyncDispose](): Promise<void>;
 }
 
 // ============================================================================

@@ -51,6 +51,16 @@ await db.transaction(async (tx) => {
 });  // BEGIN before, COMMIT after; ROLLBACK + rethrow on any throw
 ```
 
+For large result sets, stream row-by-row without materializing in memory:
+
+```js
+await using db = open(':memory:');            // async dispose: waits for iterator cleanup
+
+for await (const row of db.iterate('SELECT * FROM big_table')) {
+  if (row.id > 10_000) break;                 // break / throw cleanly disposes the stream
+}
+```
+
 ## Why
 
 ### Which package should I use?
@@ -285,10 +295,12 @@ the shortcut methods (`query`, `all`, `get`, `run`, `exec`, `prepare`,
 | `db.run(sql, params?)` | `Promise<{ rowsChanged }>` | Execute for side effects (DML/DDL). |
 | `db.exec(sql)` | `Promise<void>` | Fire-and-forget multi-statement; no params, no rows. |
 | `db.prepare(sql)` | `Promise<Statement<T>>` | Returns a reusable `Statement`. Caller closes it. |
+| `db.iterate(sql, params?)` | `AsyncIterableIterator<T>` | Stream rows row-by-row. Sugar that prepares a temp Statement lazily on first `.next()`; the temp Statement is closed in `finally`. *(v0.3+)* |
 | `db.transaction(fn)` | `Promise<R>` | BEGIN before, COMMIT after success, ROLLBACK + rethrow on throw. |
 | `db.connect()` | `Connection` | A fresh, independent Connection. |
-| `db.close()` | `void` (sync) | Closes the database and the implicit Connection. Idempotent. |
-| `db[Symbol.dispose]()` | `void` | Same as `close()`. Enables `using db = open(...)`. |
+| `db.close()` | `Promise<void>` | Closes the database and the implicit Connection. Idempotent. Async as of v0.3 (the public handle still nulls out synchronously so `db.close(); db.handle === null` continues to hold). |
+| `db[Symbol.dispose]()` | `void` | Fires `close().catch(...)` — fire-and-forget. Enables `using db = open(...)`. |
+| `db[Symbol.asyncDispose]()` | `Promise<void>` | Awaits `close()`. Enables `await using db = open(...)`. Preferred for streaming. *(v0.3+)* |
 
 ### `Connection`
 
@@ -300,11 +312,13 @@ on one Database run independently — use them for parallelism.
 |---|---|---|
 | `conn.query(sql, params?)` | `Promise<QueryResult<T>>` | Execute. Internally one-shot for no params; prepared+execute+destroy if params given. |
 | `conn.all/get/run/exec/prepare/transaction` | (same as `Database`) | Shortcuts mirror `Database`. |
+| `conn.iterate(sql, params?)` | `AsyncIterableIterator<T>` | Stream rows. Sugar over `prepare(sql).iterate(params)`; lazy temp Statement. *(v0.3+)* |
 | `conn.append(table, columns, rows)` | `Promise<{ rows: number }>` | Bulk insert via DuckDB's Appender API. Fastest path for loading many rows. See [`examples/appender.mjs`](./examples/appender.mjs). |
 | `conn.executeBatchPrepared(sql, batches)` | `Promise<{ rows: number }>` | Advanced: execute one prepared statement multiple times with batched parameter sets. |
 | `conn.countStatements(sql)` | `number` (sync) | Parses `sql`; returns the number of statements without executing. Throws on parse failure. |
-| `conn.close()` | `void` (sync) | Closes the connection. Idempotent. |
-| `conn[Symbol.dispose]()` | `void` | Same as `close()`. |
+| `conn.close()` | `Promise<void>` | Closes the connection. Idempotent. Async as of v0.3 (cancels active iterators before destroy; public handle nulls out synchronously). |
+| `conn[Symbol.dispose]()` | `void` | Fires `close().catch(...)` — fire-and-forget. |
+| `conn[Symbol.asyncDispose]()` | `Promise<void>` | Awaits `close()`. *(v0.3+)* |
 | `conn.handle` | `bigint \| null` | Internal: handle to the underlying `duckdb_connection`. |
 
 ### `Statement`
@@ -325,8 +339,10 @@ for (const [id, name] of rows) await stmt.run([id, name]);
 | `stmt.all(params?)` | `Promise<QueryResult<T>>` | Bind, execute, return all rows. |
 | `stmt.get(params?)` | `Promise<T \| undefined>` | First row, or undefined. |
 | `stmt.run(params?)` | `Promise<{ rowsChanged }>` | Execute for side effects. |
-| `stmt.close()` | `void` (sync) | Free the prepared handle. Idempotent. |
-| `stmt[Symbol.dispose]()` | `void` | Same as `close()`. |
+| `stmt.iterate(params?)` | `AsyncIterableIterator<T>` | Bind + execute, then stream rows one at a time. Holds the owning Connection's lock for the iterator's lifetime — concurrent ops on that Connection queue. Use multiple `db.connect()` for parallel streams. *(v0.3+)* |
+| `stmt.close()` | `Promise<void>` | Free the prepared handle. Idempotent. Async as of v0.3 (cancels any active iterator before destroy; `.closed` still flips synchronously). |
+| `stmt[Symbol.dispose]()` | `void` | Fires `close().catch(...)` — fire-and-forget. |
+| `stmt[Symbol.asyncDispose]()` | `Promise<void>` | Awaits `close()`. *(v0.3+)* |
 | `stmt.closed` | `boolean` | True after close. Subsequent calls throw `DuckDBClosedError`. |
 
 Parameters are positional **arrays** — `[1, 'foo']`, not
@@ -476,6 +492,7 @@ SQL casts: `'SELECT CAST(? AS UINTEGER)'`.
 - [`examples/basic.mjs`](./examples/basic.mjs) — `using db = open(...)`, db.exec/run/all/get, parameters
 - [`examples/prepared.mjs`](./examples/prepared.mjs) — prepared statements, transactions, real timings
 - [`examples/appender.mjs`](./examples/appender.mjs) — 100k bulk insert via the Appender API
+- [`examples/iterate.mjs`](./examples/iterate.mjs) — streaming with `stmt.iterate()` / `conn.iterate()` / `db.iterate()`, early-break cleanup, parallel streams across two Connections *(v0.3+)*
 
 ## Roadmap
 
@@ -502,10 +519,22 @@ SQL casts: `'SELECT CAST(? AS UINTEGER)'`.
 - [x] CI runs the full test suite + smokes the examples on all four
       platforms on every push.
 
-### v0.3.0 — planned
+### v0.3.0 — shipped
 
-- [ ] `Statement.iterate(params?)` returning `AsyncIterable<T>` for
-      streaming large result sets without materialization
+- [x] **`Statement.iterate(params?)`** returning `AsyncIterableIterator<T>`
+      for streaming large result sets without materialization, plus
+      `Connection.iterate(sql, params?)` and `Database.iterate(sql,
+      params?)` sugar (lazy-prepare).
+- [x] **Per-Connection locks** (previously process-global), so a
+      streaming iterator on one Connection no longer blocks queries
+      on sibling Connections.
+- [x] **`[Symbol.asyncDispose]`** on `Database`, `Connection`,
+      `Statement` for `await using db = open(...)`. Soft-breaking
+      change: `close()` is now async (handle still nulls out
+      synchronously; FFI destroy in the returned Promise).
+
+### v0.3.x — still planned
+
 - [ ] `conn.chunks(sql, params?)` exposing raw chunk iteration for
       maximum efficiency on multi-million-row results
 - [ ] Nested transactions via `SAVEPOINT` (currently throws
