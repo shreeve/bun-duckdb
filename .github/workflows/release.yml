@@ -1,9 +1,25 @@
 name: release
 
-# Triggers on tag push (v0.2.1, v0.3.0, etc.). Builds the FFI shim on
-# all four supported platforms, bundles the shims into the package, and
-# publishes to npm. Falls back to creating a GitHub release with the
+# Triggers on tag push (v0.2.1, v0.3.0, etc.). Builds the FFI shim per
+# platform, bundles whichever shims actually got built into the package,
+# and publishes to npm. Falls back to creating a GitHub release with the
 # tarball as an asset if NPM_TOKEN is not configured.
+#
+# Job topology:
+#
+#   build-shim-required  (3-platform matrix: linux-x64, linux-arm64, darwin-arm64)
+#                         ↓ blocks
+#   build-shim-optional  (1-job: darwin-x64)         publish
+#                         (parallel; never blocks)     ↓
+#                                                    Pack + npm publish + GitHub release
+#
+# darwin-x64 lives in its own optional job because GitHub's macos-13
+# (Intel) runner pool is small enough to queue jobs for hours. We don't
+# want a wedged Intel runner to delay every release indefinitely. The
+# publish step downloads ALL artifacts in flight at that moment — if
+# darwin-x64 has finished by then, its shim ships in the tarball; if
+# not, the tarball ships without it and Intel-Mac users fall back to
+# `make -C lib` as documented in the README.
 
 on:
   push:
@@ -14,15 +30,13 @@ env:
   DUCKDB_VERSION: v1.5.2
 
 jobs:
-  build-shim:
+  # ============================================================
+  # Required shims — must all succeed for publish to proceed
+  # ============================================================
+  build-shim-required:
     name: build-shim ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
-    # macos-13 (Intel) runners are scarce on GitHub and can sit queued for
-    # hours. Mark darwin-x64 as optional so a wedged Intel runner doesn't
-    # block the publish forever — the resulting tarball just ships without
-    # the Intel-Mac shim, and Intel users fall back to `make -C lib`.
-    continue-on-error: ${{ matrix.optional == true }}
-    timeout-minutes: 60
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -31,22 +45,14 @@ jobs:
             os: ubuntu-latest
             duckdb_asset: libduckdb-linux-amd64.zip
             shim_artifact: libduckdb-shim-linux-x64.so
-            optional: false
           - label: linux-arm64
             os: ubuntu-24.04-arm
             duckdb_asset: libduckdb-linux-arm64.zip
             shim_artifact: libduckdb-shim-linux-arm64.so
-            optional: false
-          - label: darwin-x64
-            os: macos-13
-            duckdb_asset: libduckdb-osx-universal.zip
-            shim_artifact: libduckdb-shim-darwin-x64.dylib
-            optional: true
           - label: darwin-arm64
             os: macos-latest
             duckdb_asset: libduckdb-osx-universal.zip
             shim_artifact: libduckdb-shim-darwin-arm64.dylib
-            optional: false
     steps:
       - uses: actions/checkout@v4
 
@@ -87,8 +93,47 @@ jobs:
           path: lib/${{ matrix.shim_artifact }}
           retention-days: 1
 
+  # ============================================================
+  # Optional shim — runs in parallel; publish never waits on this
+  # ============================================================
+  build-shim-optional-darwin-x64:
+    name: build-shim darwin-x64 (optional)
+    runs-on: macos-13
+    timeout-minutes: 60
+    continue-on-error: true   # never fails the workflow regardless of outcome
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libduckdb
+        run: |
+          set -euo pipefail
+          curl -fsSL -o libduckdb.zip \
+            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/libduckdb-osx-universal.zip"
+          unzip -q libduckdb.zip -d libduckdb
+          if [ -d /opt/homebrew ]; then
+            BREW_PREFIX=/opt/homebrew
+          else
+            BREW_PREFIX=/usr/local
+          fi
+          sudo mkdir -p "$BREW_PREFIX/lib" "$BREW_PREFIX/include"
+          sudo cp libduckdb/libduckdb.dylib "$BREW_PREFIX/lib/"
+          sudo cp libduckdb/duckdb.h        "$BREW_PREFIX/include/" || true
+
+      - name: Build platform-tagged FFI shim
+        run: make -C lib TAGGED=1
+
+      - name: Upload shim artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libduckdb-shim-darwin-x64.dylib
+          path: lib/libduckdb-shim-darwin-x64.dylib
+          retention-days: 1
+
+  # ============================================================
+  # Publish — depends ONLY on required shims; uses optional if available
+  # ============================================================
   publish:
-    needs: build-shim
+    needs: build-shim-required
     runs-on: ubuntu-latest
     permissions:
       contents: write   # needed to create the GitHub release
@@ -107,20 +152,20 @@ jobs:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
 
-      # Pull all four platform shims into lib/ before bundling.
       - name: Download shim artifacts
+        # Pulls every artifact uploaded so far across the run. If
+        # build-shim-optional-darwin-x64 has finished by now its shim
+        # is included; if not, the staging step ships without it.
         uses: actions/download-artifact@v4
         with:
           path: lib-shims
 
       - name: Stage shims into lib/
-        # Each matrix shim is uploaded as its own artifact. Required shims
-        # (linux-x64, linux-arm64, darwin-arm64) must all be present. The
-        # darwin-x64 shim is optional — if its build job hung in queue
-        # and never produced an artifact, we ship without it and warn
-        # rather than fail the release.
+        # Required shims (linux-x64, linux-arm64, darwin-arm64) must all
+        # be present — publish fails otherwise. The darwin-x64 shim is
+        # best-effort.
         run: |
-          set -uo pipefail   # NOT -e: we want the missing-optional path to succeed
+          set -uo pipefail   # NOT -e: optional-missing path must not fail
 
           stage() {
             local name=$1
@@ -130,7 +175,7 @@ jobs:
               cp "$src" lib/
               echo "  ✅ staged $name"
             elif [ "$required" = "required" ]; then
-              echo "::error::Required shim $name was not produced by build-shim job."
+              echo "::error::Required shim $name was not produced."
               exit 1
             else
               echo "::warning::Optional shim $name not available — tarball will ship without it."
