@@ -4,6 +4,111 @@ All notable changes documented here. Versioning follows
 [semver](https://semver.org/) — `0.x` releases may make breaking changes
 between minor versions until the `1.0.0` API freeze.
 
+## 0.4.0 — 2026-05-15
+
+Adds the `duckdb-bun/async` subpath — same API surface as the main
+package, but every DuckDB call runs inside a `Worker` so the main event
+loop stays responsive for HTTP / interactive workloads. Designed
+end-to-end before any implementation landed; design contract at
+[`docs/rfcs/0001-worker-async-api.md`](./docs/rfcs/0001-worker-async-api.md).
+
+### Added
+
+- **`duckdb-bun/async`** subpath: `import { open } from 'duckdb-bun/async'`.
+  Spawns one Bun `Worker` per `AsyncDatabase`; the Worker imports the
+  v0.3 main-thread driver wholesale and dispatches against a numeric-ID
+  registry. No raw FFI handles cross `postMessage`; result rows go
+  through structuredClone (which preserves `Uint8Array`, `BigInt`,
+  `Date`, plus the sidecar `.columns` / `.rowsChanged` properties on
+  `QueryResult` arrays).
+- **All four proxy classes** — `AsyncDatabase`, `AsyncConnection`,
+  `AsyncStatement`, `AsyncAppender` — mirror the v0.3 surface 1:1.
+  Every public method that crosses the wire is `async`. `Symbol.dispose`
+  is fire-and-forget (`close().catch(...)`); **`Symbol.asyncDispose` is
+  the preferred dispose pattern** for streaming code (`await using db =
+  open(...)`).
+- **Lazy open.** `open(path)` returns a proxy synchronously; the Worker
+  spawns and `duckdb_open` runs on the first awaited op. Concurrent
+  first-callers share one `#openPromise`. If open fails, the error is
+  cached in `#openFailed` and every subsequent call rejects with the
+  same identity error.
+- **Pull-based streaming** for `AsyncStatement.iterate()`. Each
+  `iterNext` request returns up to one DuckDB vector (≤2048 rows) as
+  a freshly-allocated `rows` array; the wrapper drains the chunk
+  locally and yields rows one at a time. Configurable `prefetch:
+  number` option (default `1`, range `[0, 4]`) keeps one chunk in
+  flight while the consumer processes the previous one. `break` /
+  `throw` / explicit `.return()` cleanly send `iterReturn` and drain
+  any in-flight prefetch.
+- **`AsyncAppender` streaming form** via `conn.append(table, columns)`.
+  `appendRow(values)` is sync, matching the main-thread API; rows are
+  buffered locally and sent in batches (default `batchSize: 1000`).
+  `flush()` and `close()` drain the buffer + tell the worker to flush
+  to DuckDB. Sticky **poisoned state**: after a batch failure,
+  subsequent `appendRow()` calls throw the cached error synchronously
+  on the proxy (no round-trip).
+- **`Database.transaction(fn)` / `Connection.transaction(fn)`** —
+  worker allocates a fresh dedicated `Connection` for each
+  transaction (returned as `txnConnId`); the user's callback receives
+  a connection-shaped proxy whose ops route to that connection.
+  Commit on resolve; rollback + rethrow on throw. Nested transactions
+  throw `DuckDBTransactionError` **on the proxy side** without a
+  round-trip.
+- **`DuckDBWorkerCrashedError`** (extends `DuckDBError`) — thrown when
+  the Worker exits unexpectedly. All pending request promises reject
+  with it; future calls reject with `DuckDBClosedError`. No promise
+  hangs forever.
+- **Configurable close timeout.** `db.close({ timeout: ms })`
+  force-terminates the Worker after the timeout, rejecting any
+  pending requests with `DuckDBWorkerCrashedError('close timeout')`.
+  Default: no timeout (wait forever).
+- **`examples/async.mjs`** — runnable demo showing the lazy-open
+  proxy, iterate, transactions, streaming appender, and the
+  event-loop-responsiveness payoff (~90% of timer ticks fire during
+  a ~500ms heavy query). Wired into CI smoke.
+- **`bench/async-vs-sync.mjs`** — four-benchmark harness per RFC §12
+  (event-loop responsiveness, small-query latency, large-result
+  transport, appender throughput). On a 2024 M-series Mac:
+  - Responsiveness: sync 0% / async ~90% of expected ticks
+  - Small queries: sync ~22k ops/s / async ~16k ops/s (~25% overhead)
+  - 1M-row iterate: sync ~250ms / async prefetch=1 ~380ms /
+    prefetch=4 ~340ms
+  - 100K-row appender: sync ~10M rows/s / async ~5M rows/s
+
+### Acknowledged limitations
+
+- **No cancellation in v0.4.** `AbortSignal` / `duckdb_interrupt()`
+  is the headline v0.5 feature (see [RFC §16 #5](./docs/rfcs/0001-worker-async-api.md#16--open-questions--resolved-decisions)
+  for rationale). Users wanting bounded shutdown should use
+  `db.close({ timeout })`.
+- **One Worker per Database.** No Worker pooling. Heavy multi-tenant
+  workloads should evaluate cost; revisit if needed in v0.4.x.
+- **No `Transferable` optimization** for result transport.
+  structuredClone for now; benchmark before optimizing.
+- **Bun-only.** The async subpath uses `Worker` semantics that aren't
+  perfectly portable to Node.
+
+### Internal
+
+- New files: `lib/async/index.mjs`, `lib/async/index.d.ts`,
+  `lib/async/worker.mjs`, `lib/async/protocol.mjs`,
+  `lib/async/protocol.d.ts`. Shared `ERROR_CLASSES` registry in
+  `protocol.mjs` keeps error reconstruction in lockstep across the
+  two threads.
+- `package.json` `exports['./async']` + `files['lib/async/...']`.
+- 44 new tests in `test/async/async.test.mjs` covering lazy open,
+  queries, disposal, AsyncConnection, AsyncStatement (including
+  iterate with prefetch 0/1/4), transactions (commit / rollback /
+  nested / recovery), AsyncAppender (one-shot + streaming + 100k
+  rows + poisoned state), close coordination, and type round-trip
+  for `BLOB` / `Date` / `BIGINT`.
+- Total test count: 134 main + 44 async = **178**.
+
+### Roadmap shift
+
+The v0.4 RFC pushed `AbortSignal` support to v0.5 and Windows to v0.6.
+README's Roadmap section reflects this.
+
 ## 0.3.0 — 2026-05-15
 
 Streaming results via `Statement.iterate()` — pull rows one at a time

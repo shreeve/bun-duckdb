@@ -824,16 +824,16 @@ This catches:
 Items marked **resolved** are locked in; **open** items must be
 spiked or decided before approval.
 
-1. **Bun Worker file URL under npm-install — OPEN.** `new Worker(new
-   URL('./worker.mjs', import.meta.url))` is the obvious shape, but
-   verify it survives the install path
-   (`node_modules/duckdb-bun/lib/async/worker.mjs`) without any
-   bundler help. Spike step: `npm pack && bun add ./duckdb-bun-0.4.0.tgz`
-   in a fresh tempdir; `bun -e "import { open } from 'duckdb-bun/async'
-   ; const db = open(':memory:'); console.log(await db.get('SELECT 1'))"`.
-   If the URL doesn't resolve, ship an absolute-path resolver
-   (`require.resolve('duckdb-bun/lib/async/worker.mjs')` or equivalent).
-   This is a blocker for v0.4.0 — do this spike first.
+1. **Bun Worker file URL under npm-install — RESOLVED (2026-05-15).**
+   Spiked with a minimal `dbn-worker-spike` package: a stub
+   `lib/async/index.mjs` that does `new Worker(new URL('./worker.mjs',
+   import.meta.url).href)`, packed and installed via `bun add
+   ./*.tgz` into a fresh tempdir. The Worker spawned correctly from
+   `file:///.../node_modules/dbn-worker-spike/lib/async/worker.mjs`,
+   `import.meta.url` matched on the worker side, and ping/pong
+   round-tripped. **No fallback resolver needed** — the simple URL
+   shape works under `node_modules`. Implementation can use the
+   pattern in §11 verbatim.
 2. **`OpenOptions` shape — RESOLVED.** Defer until v0.3.x ships
    options on the main-thread API. The async subpath is a strict
    superset of main; it'll inherit whatever shape v0.3.x lands on.
@@ -934,12 +934,13 @@ This RFC is **draft v2 — awaiting user approval**. To advance to
    together), the transaction semantics (§7), and the deferral of
    cancellation to v0.5 (§16 #5). These are the load-bearing
    decisions.
-3. **TODO — v0.3.0 must be published on npm.** The async subpath
-   consumes the v0.3 driver wholesale; v0.4 can't ship until v0.3
-   is out.
-4. **TODO — spike open question #1** (Bun Worker file URL under
-   npm-install). One-shot test before locking the implementation
-   shape.
+3. ✅ v0.3.0 published on npm (2026-05-15). The async subpath
+   consumes the v0.3 driver wholesale; this prerequisite was the
+   gate for `lib/async/worker.mjs` importing `../duckdb.mjs`.
+4. ✅ Spike open question #1 — Bun Worker URL resolution under
+   npm-install — passed (2026-05-15). The simple `new Worker(new
+   URL('./worker.mjs', import.meta.url))` pattern works without
+   any fallback machinery.
 
 Once those four items are green, implementation proceeds. Until
 then, **do not write any code under `lib/async/`.**

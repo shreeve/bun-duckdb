@@ -94,6 +94,7 @@ jobs:
           bun examples/prepared.mjs
           bun examples/appender.mjs
           bun examples/iterate.mjs
+          bun examples/async.mjs
 
       - name: Upload shim artifact (consumed by release.yml on tag pushes)
         uses: actions/upload-artifact@v4

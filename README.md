@@ -61,6 +61,27 @@ for await (const row of db.iterate('SELECT * FROM big_table')) {
 }
 ```
 
+For HTTP servers and interactive workloads, run DuckDB on a Worker thread
+via the `duckdb-bun/async` subpath. Identical API surface, but every
+query runs off the main event loop, so the loop stays responsive:
+
+```js
+import { open } from 'duckdb-bun/async';      // note: /async subpath
+
+await using db = open(':memory:');            // sync proxy; worker spawns lazily
+
+await db.exec('CREATE TABLE users (id INT, name VARCHAR)');
+const rows = await db.all('SELECT * FROM users');
+
+// While a heavy query runs, the main event loop stays free:
+const big = db.get('SELECT count(*) FROM range(1500000) a, range(80) b WHERE (a.range + b.range) % 7 = 0');
+const t = setInterval(() => console.log('tick'), 100);   // these still fire on time
+await big;
+clearInterval(t);
+```
+
+See [`examples/async.mjs`](./examples/async.mjs) for the full surface.
+
 ## Why
 
 ### Which package should I use?
@@ -493,6 +514,7 @@ SQL casts: `'SELECT CAST(? AS UINTEGER)'`.
 - [`examples/prepared.mjs`](./examples/prepared.mjs) — prepared statements, transactions, real timings
 - [`examples/appender.mjs`](./examples/appender.mjs) — 100k bulk insert via the Appender API
 - [`examples/iterate.mjs`](./examples/iterate.mjs) — streaming with `stmt.iterate()` / `conn.iterate()` / `db.iterate()`, early-break cleanup, parallel streams across two Connections *(v0.3+)*
+- [`examples/async.mjs`](./examples/async.mjs) — `duckdb-bun/async` Worker-backed subpath: same API, event loop stays responsive during heavy queries *(v0.4+)*
 
 ## Roadmap
 
@@ -533,7 +555,20 @@ SQL casts: `'SELECT CAST(? AS UINTEGER)'`.
       change: `close()` is now async (handle still nulls out
       synchronously; FFI destroy in the returned Promise).
 
-### v0.3.x — still planned
+### v0.4.0 — shipped
+
+- [x] **`duckdb-bun/async`** Worker-backed subpath — same API as the
+      main package, but every DuckDB call runs inside a Worker so the
+      main event loop stays responsive during long queries.
+      Benchmark: ~90% of expected timer ticks fire during a 450ms
+      async query (vs 0% sync). Small-query overhead is ~25%.
+- [x] Pull-based per-chunk streaming over `postMessage` with
+      configurable `prefetch: 1` (range `[0, 4]`).
+- [x] Streaming `AsyncAppender` with proxy-side batching
+      (default `batchSize: 1000`), sticky poisoned-state on batch
+      error.
+
+### v0.3.x / v0.4.x — still planned
 
 - [ ] `conn.chunks(sql, params?)` exposing raw chunk iteration for
       maximum efficiency on multi-million-row results
@@ -544,12 +579,17 @@ SQL casts: `'SELECT CAST(? AS UINTEGER)'`.
 - [ ] Configurable type conversion — opt-in `DECIMAL → string` mode
       to preserve precision past 15 digits
 
-### v0.4.0 — `duckdb-bun/async` (Worker-backed)
+### v0.5.0 — `AbortSignal` cancellation
 
-- [ ] `import { open } from 'duckdb-bun/async'` — same API surface
-      but runs DuckDB in a Worker so analytical queries don't block
-      the main event loop
-- [ ] `AbortSignal` support backed by `duckdb_interrupt()`
+- [ ] `AbortSignal` support backed by `duckdb_interrupt()` across both
+      `duckdb-bun` and `duckdb-bun/async`. Deferred from v0.4 for
+      scope reasons; will be the headline v0.5 feature.
+
+### v0.6.0 — Windows x86_64
+
+- [ ] Pre-built shim binary for `win32-x64` + MSVC build target.
+      Was originally v0.5; pushed back to v0.6 when cancellation
+      took the v0.5 slot.
 
 ### v1.0.0 — stable API
 

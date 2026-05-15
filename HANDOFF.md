@@ -1273,8 +1273,39 @@ docs for *how the system is structured*.
 - 2026-05-15 — v0.2.3 shipped. HANDOFF.md created (this doc).
 - 2026-05-15 — Reviewed by GPT-5.5; rewrote with stronger defaults
   for iterator locking, worker architecture, and Windows build.
-- 2026-05-15 — **v0.3.0 work item completed locally** (ship-ready,
-  awaiting user-mediated push/tag). Notes from implementation:
+- 2026-05-15 — **v0.3.0 shipped** to npm. End-to-end ship sequence
+  succeeded on first try (commit + push + CI green + tag + release.yml
+  + npm publish + smoke from fresh tempdir).
+- 2026-05-15 — **v0.4.0 work item completed locally** (ship-ready;
+  awaiting user-mediated commit/tag). Notes from implementation:
+  - RFC `docs/rfcs/0001-worker-async-api.md` written first per the
+    §7 MUST; spike of Worker URL resolution under npm-install
+    confirmed `new Worker(new URL('./worker.mjs', import.meta.url))`
+    works without fallback machinery.
+  - Architecture: one Worker per `AsyncDatabase`; worker imports the
+    v0.3 driver wholesale and dispatches against a numeric-ID
+    registry. No FFI handles cross `postMessage`. Reused the v0.3
+    Connection's `AsyncMutex` for serialization on the worker side —
+    no second locking implementation.
+  - Key bugs caught + fixed during implementation: (1) state ordering
+    in `_send` — `#openFailed` must be checked BEFORE `state ===
+    'crashed'` because failed-open sets crashed state; (2) Appender
+    `close()` flipped state to `'closing'` BEFORE calling `flush()`,
+    but `flush()` rejected if state wasn't `'open'` — lost rows;
+    (3) `close({ timeout: 0 })` left pending requests stranded —
+    fixed by rejecting all `#pending` entries after worker terminate;
+    (4) test framework hangs on `await expect(...).rejects.toThrow()`
+    pattern when the rejecting promise involves Worker round-trips —
+    switched to plain `try/catch` in tests.
+  - 178 total tests passing (134 main + 44 async). Benchmark shows
+    sync blocks main-loop 100% during heavy queries; async lets ~90%
+    of expected timer ticks fire. Small-query overhead ~25%; large
+    iterate within 1.4× of sync iterate; appender within 2× of sync.
+  - Old notes from v0.3.0 work below.
+
+  ---
+
+  Previously, v0.3.0 implementation:
   - **Per-Connection locks shipped** as foundational refactor before
     `iterate()` itself. The pre-existing process-global `withLock`
     was replaced with an `AsyncMutex` class instance owned by each

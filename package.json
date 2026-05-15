@@ -1,6 +1,6 @@
 {
   "name": "duckdb-bun",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Efficient DuckDB driver for Bun, using pure FFI",
   "type": "module",
   "sideEffects": false,
@@ -11,6 +11,11 @@
       "types": "./lib/duckdb.d.ts",
       "import": "./lib/duckdb.mjs",
       "default": "./lib/duckdb.mjs"
+    },
+    "./async": {
+      "types": "./lib/async/index.d.ts",
+      "import": "./lib/async/index.mjs",
+      "default": "./lib/async/index.mjs"
     }
   },
   "files": [
@@ -22,6 +27,11 @@
     "lib/libduckdb-shim-linux-arm64.so",
     "lib/libduckdb-shim-darwin-x64.dylib",
     "lib/libduckdb-shim-darwin-arm64.dylib",
+    "lib/async/index.mjs",
+    "lib/async/index.d.ts",
+    "lib/async/worker.mjs",
+    "lib/async/protocol.mjs",
+    "lib/async/protocol.d.ts",
     "README.md",
     "AGENTS.md",
     "CHANGELOG.md",
@@ -33,7 +43,9 @@
     "example:basic": "bun examples/basic.mjs",
     "example:prepared": "bun examples/prepared.mjs",
     "example:appender": "bun examples/appender.mjs",
-    "example:iterate": "bun examples/iterate.mjs"
+    "example:iterate": "bun examples/iterate.mjs",
+    "example:async": "bun examples/async.mjs",
+    "bench:async": "bun bench/async-vs-sync.mjs"
   },
   "keywords": [
     "duckdb",
