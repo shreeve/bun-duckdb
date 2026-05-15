@@ -645,6 +645,86 @@ d('Iterator races', () => {
   });
 });
 
+// ============================================================================
+// v0.5 features in the async subpath
+// ============================================================================
+
+d('async OpenOptions parity', () => {
+  test('opts (threads + memoryLimit) flow through to the worker', async () => {
+    await using db = open(':memory:', { threads: 2, memoryLimit: '256MB' });
+    const r = await db.get(`SELECT current_setting('threads') AS v`);
+    expect(r.v).toBe(2);
+  });
+
+  test('readOnly on a file-backed DB rejects writes via async', async () => {
+    const path = `/tmp/duckdb-bun-async-ro-${Date.now()}.duckdb`;
+    {
+      await using d1 = open(path);
+      await d1.exec('CREATE TABLE t (n INT)');
+    }
+    try {
+      await using d2 = open(path, { readOnly: true });
+      let caught;
+      try { await d2.exec('INSERT INTO t VALUES (1)'); }
+      catch (e) { caught = e; }
+      expect(caught).toBeTruthy();
+    } finally {
+      try { (await import('fs')).unlinkSync(path); } catch {}
+      try { (await import('fs')).unlinkSync(path + '.wal'); } catch {}
+    }
+  });
+
+  test('bad opts (negative threads) caches a sticky open failure', async () => {
+    const db = open(':memory:', { threads: -1 });
+    let e1, e2;
+    try { await db.get('SELECT 1'); } catch (e) { e1 = e; }
+    try { await db.get('SELECT 1'); } catch (e) { e2 = e; }
+    expect(e1).toBeInstanceOf(DuckDBError);
+    expect(e2).toBeInstanceOf(DuckDBError);
+    expect(e1).toBe(e2);
+    await db.close();
+  });
+});
+
+d('async pragma / extension / chunks', () => {
+  test('db.pragma version returns a row', async () => {
+    await using db = open(':memory:');
+    const v = await db.pragma('version');
+    expect(typeof v.library_version).toBe('string');
+  });
+
+  test('db.pragma set-form changes a setting', async () => {
+    await using db = open(':memory:');
+    await db.pragma('threads', 2);
+    const r = await db.get(`SELECT current_setting('threads') AS v`);
+    expect(r.v).toBe(2);
+  });
+
+  test('installExtension validates the name', async () => {
+    await using db = open(':memory:');
+    let caught;
+    try { await db.installExtension('foo; DROP'); }
+    catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(DuckDBError);
+    expect(caught.message).toMatch(/extension name/);
+  });
+
+  test('db.chunks yields buffered chunks', async () => {
+    await using db = open(':memory:');
+    await db.exec('CREATE TABLE t (n INT)');
+    using conn = db.connect();
+    await conn.append('t', ['n'], Array.from({ length: 5000 }, (_, i) => [i]));
+    let total = 0;
+    let chunksSeen = 0;
+    for await (const c of db.chunks('SELECT * FROM t ORDER BY n')) {
+      total += c.rows.length;
+      chunksSeen++;
+    }
+    expect(total).toBe(5000);
+    expect(chunksSeen).toBeGreaterThan(1);
+  });
+});
+
 d('Async type round-trip', () => {
   test('BLOB Uint8Array round-trips through structuredClone', async () => {
     await using db = open(':memory:');

@@ -1,12 +1,15 @@
-// TypeScript declarations for duckdb-bun v0.3
+// TypeScript declarations for duckdb-bun v0.5
 //
 // Hand-written. Mirrors lib/duckdb.mjs's runtime API. Generic parameters
 // let users tighten row shapes when they know them; defaults are loose
 // (Record<string, unknown>) for ad-hoc queries.
 //
-// v0.3 additions: Statement.iterate(), Connection.iterate(),
-// Database.iterate(), [Symbol.asyncDispose] on Database/Connection/
-// Statement, and async close() (soft breaking change — see CHANGELOG).
+// v0.3: Statement.iterate(), Connection.iterate(), Database.iterate(),
+//       [Symbol.asyncDispose], async close()
+// v0.4: duckdb-bun/async subpath, AbortSignal forward-compat plumbing
+// v0.5: OpenOptions, pragma/installExtension/loadExtension helpers,
+//       chunks() chunk-by-chunk streaming, TxnHandle (scoped transaction
+//       handle that throws on use-after-callback)
 
 // ============================================================================
 // Type system
@@ -17,6 +20,68 @@ export type Row = Record<string, unknown>;
 
 /** Bind parameters for a prepared statement (positional). */
 export type Params = readonly unknown[];
+
+/** DuckDB access mode (v0.5+). Maps to the `access_mode` config key. */
+export type DuckDBAccessMode = 'AUTOMATIC' | 'READ_ONLY' | 'READ_WRITE';
+
+/**
+ * Options accepted by `open(path, opts?)` (v0.5+). Common settings are
+ * exposed as typed fields; arbitrary DuckDB config keys can be set via
+ * the `config` escape hatch. Typed options + `config` setting the same
+ * DuckDB key with different values throws; matching values are allowed.
+ */
+export interface OpenOptions {
+  /** Sugar for `accessMode: 'READ_ONLY'`. */
+  readOnly?: boolean;
+  /** DuckDB `access_mode` (maps directly). */
+  accessMode?: DuckDBAccessMode;
+  /** DuckDB `threads` (positive integer). */
+  threads?: number;
+  /** DuckDB `memory_limit` (e.g. `'1GB'`, `'512MB'`, `'80%'`). */
+  memoryLimit?: string;
+  /** DuckDB `temp_directory`. */
+  tempDirectory?: string;
+  /** Escape hatch: any DuckDB config key + value not exposed above. */
+  config?: Record<string, string | number | boolean | bigint>;
+}
+
+/** Yielded by `chunks()` iterators (v0.5+). */
+export interface RowChunk<T extends Row = Row> {
+  /** Decoded rows for this chunk. Also exposes `.columns` (same as QueryResult). */
+  rows: T[] & { columns?: ColumnInfo[] };
+  /** 0-based index of this chunk in the stream. */
+  chunkIndex: number;
+  /** Number of rows yielded before this chunk's first row. */
+  rowOffset: number;
+}
+
+/**
+ * A scoped transaction handle (v0.5+) passed to the `db.transaction(fn)`
+ * callback. Same shortcut methods as Connection, but using the handle
+ * after the callback returns/throws raises DuckDBTransactionError.
+ *
+ * Nested transactions are not currently supported (DuckDB v1.5.2
+ * doesn't parse SAVEPOINT); `tx.transaction()` always rejects with
+ * DuckDBTransactionError. The method is reserved for forward-compat
+ * when upstream lands SAVEPOINT.
+ */
+export interface TxnHandle {
+  query<T extends Row = Row>(sql: string, params?: Params): Promise<QueryResult<T>>;
+  all<T extends Row = Row>(sql: string, params?: Params): Promise<QueryResult<T>>;
+  get<T extends Row = Row>(sql: string, params?: Params): Promise<T | undefined>;
+  run(sql: string, params?: Params): Promise<RunResult>;
+  exec(sql: string): Promise<void>;
+  prepare<T extends Row = Row>(sql: string): Promise<Statement<T>>;
+  iterate<T extends Row = Row>(sql: string, params?: Params): AsyncIterableIterator<T>;
+  chunks<T extends Row = Row>(sql: string, params?: Params): AsyncIterableIterator<RowChunk<T>>;
+  pragma(name: string, value?: string | number | boolean | bigint | null): Promise<Row | undefined>;
+  installExtension(name: string): Promise<void>;
+  loadExtension(name: string): Promise<void>;
+  append(table: string, columns: string[], rows: unknown[][]): Promise<AppendResult>;
+  executeBatchPrepared(sql: string, batches: unknown[][]): Promise<AppendResult>;
+  /** Always rejects with DuckDBTransactionError until upstream SAVEPOINT support lands. */
+  transaction<R>(fn: (tx: TxnHandle) => Promise<R>): Promise<R>;
+}
 
 /** Column metadata attached to QueryResult. */
 export interface ColumnInfo {
@@ -156,12 +221,27 @@ export class Database {
 
   /**
    * Run fn() inside a transaction. BEGIN before, COMMIT after success,
-   * ROLLBACK + rethrow on any throw. fn receives the underlying Connection.
+   * ROLLBACK + rethrow on any throw. fn receives a `TxnHandle` (v0.5+)
+   * — a scoped proxy with the same shortcut methods as Connection, but
+   * marked closed after the callback so out-of-scope use throws.
    *
-   * Nested transactions throw DuckDBTransactionError in v0.2 (planned for
-   * v0.3+ via SAVEPOINT).
+   * Nested transactions throw `DuckDBTransactionError`: DuckDB v1.5.2
+   * doesn't parse SAVEPOINT. Reserved for forward-compat when upstream
+   * lands savepoint support.
    */
-  transaction<R>(fn: (tx: Connection) => Promise<R>): Promise<R>;
+  transaction<R>(fn: (tx: TxnHandle) => Promise<R>): Promise<R>;
+
+  /** Run `PRAGMA name` (get) or `PRAGMA name=value` (set). Returns the first row, or undefined. (v0.5+) */
+  pragma(name: string, value?: string | number | boolean | bigint | null): Promise<Row | undefined>;
+
+  /** `INSTALL <name>` with strict identifier validation. (v0.5+) */
+  installExtension(name: string): Promise<void>;
+
+  /** `LOAD <name>` with strict identifier validation. (v0.5+) */
+  loadExtension(name: string): Promise<void>;
+
+  /** Stream rows chunk-by-chunk (DuckDB vector ≈ 2048 rows per chunk). (v0.5+) */
+  chunks<T extends Row = Row>(sql: string, params?: Params): AsyncIterableIterator<RowChunk<T>>;
 
   /**
    * Close the database. Idempotent.
@@ -233,8 +313,20 @@ export class Connection {
    */
   iterate<T extends Row = Row>(sql: string, params?: Params): AsyncIterableIterator<T>;
 
-  /** Run fn() inside a transaction. See Database.transaction for semantics. */
-  transaction<R>(fn: (tx: Connection) => Promise<R>): Promise<R>;
+  /** Run fn() inside a transaction. See Database.transaction for semantics. (v0.5: tx is a TxnHandle, not a Connection.) */
+  transaction<R>(fn: (tx: TxnHandle) => Promise<R>): Promise<R>;
+
+  /** Run `PRAGMA name` (get) or `PRAGMA name=value` (set). (v0.5+) */
+  pragma(name: string, value?: string | number | boolean | bigint | null): Promise<Row | undefined>;
+
+  /** `INSTALL <name>` with strict identifier validation. (v0.5+) */
+  installExtension(name: string): Promise<void>;
+
+  /** `LOAD <name>` with strict identifier validation. (v0.5+) */
+  loadExtension(name: string): Promise<void>;
+
+  /** Stream rows chunk-by-chunk. (v0.5+) */
+  chunks<T extends Row = Row>(sql: string, params?: Params): AsyncIterableIterator<RowChunk<T>>;
 
   /**
    * Close the connection. Async as of v0.3 — cancels any active iterator
@@ -315,8 +407,11 @@ export class Statement<T extends Row = Row> {
 /**
  * Open (or create) a DuckDB database at `path`. Use `':memory:'` for an
  * in-memory database.
+ *
+ * v0.5+: optional `opts` for startup config (readOnly, accessMode,
+ * threads, memoryLimit, tempDirectory, plus raw `config:` escape hatch).
  */
-export function open(path: string): Database;
+export function open(path: string, opts?: OpenOptions): Database;
 
 /** Returns the version string of the loaded libduckdb (e.g. "v1.5.2"). */
 export function version(): string;

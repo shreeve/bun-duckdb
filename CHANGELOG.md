@@ -4,6 +4,114 @@ All notable changes documented here. Versioning follows
 [semver](https://semver.org/) — `0.x` releases may make breaking changes
 between minor versions until the `1.0.0` API freeze.
 
+## 0.5.0 — 2026-05-15
+
+Core-polish release. Reorders the roadmap after a "are we still on
+track with the package's goals?" check-in: instead of pushing further
+async-subpath work (AbortSignal cancellation, Windows), this release
+fills out the main driver with affordances that have been sitting in
+the roadmap since v0.2. Cancellation is now v0.6; Windows is v0.7.
+
+### Added
+
+- **`open(path, opts?)` accepts `OpenOptions`** — startup config via
+  `duckdb_create_config` + `duckdb_open_ext`. Typed shortcuts:
+  - `readOnly: boolean` — sugar for `accessMode: 'READ_ONLY'`
+  - `accessMode: 'AUTOMATIC' | 'READ_ONLY' | 'READ_WRITE'`
+  - `threads: number` (positive integer)
+  - `memoryLimit: string` (e.g. `'1GB'`, `'512MB'`)
+  - `tempDirectory: string`
+  - `config: Record<string, string|number|boolean|bigint>` — escape
+    hatch for any DuckDB config key not exposed above
+
+  Typed options and `config` setting the **same DuckDB key with
+  different values** throw `DuckDBError` instead of silently choosing
+  one (per GPT-5.5 review: "avoid 'why did my DB open read-write?'
+  bugs"). Mirrored on the async subpath; opts flow through the
+  `open` op to the worker.
+
+- **`Connection.pragma(name, value?)`** + `Database.pragma()` — thin
+  PRAGMA wrapper with strict `^[A-Za-z_][A-Za-z0-9_]*$` identifier
+  validation and SQL-literal escaping on values. Get-form returns the
+  first row object (multi-column for pragmas like `database_size` and
+  `version`); set-form runs `PRAGMA name=value`. **Note:** DuckDB
+  distinguishes PRAGMAs (function-like queries) from runtime
+  *settings* like `threads`/`memory_limit` — set-form works for
+  settings, but get-form does NOT (DuckDB exposes setting reads via
+  `current_setting()`). See the method's JSDoc for the recommended
+  patterns.
+
+- **`Connection.installExtension(name)` / `loadExtension(name)`**
+  (plus Database sugar) — `INSTALL <name>` and `LOAD <name>` with
+  the same identifier validation. Safe to call with user input.
+
+- **`chunks()` chunk-by-chunk streaming** — exposes the natural
+  DuckDB vector boundary that `iterate()` papers over. Yields
+  `{ rows: Row[], chunkIndex: number, rowOffset: number }` where
+  `rows` carries a `.columns` sidecar matching `QueryResult`. Same
+  lock/lifecycle model as `iterate()`: holds the Connection's
+  lock for the iterator's lifetime, cleans up on break/throw/return.
+  Available on `Statement`, `Connection`, and `Database` (plus async
+  parity via on-proxy buffering).
+
+- **`TxnHandle` — scoped transaction handle** (v0.5 design improvement,
+  not a behavior change). `db.transaction(async (tx) => { ... })`
+  now passes a TxnHandle, not the raw Connection. Using the handle
+  after the callback returns/throws raises `DuckDBTransactionError`.
+  This catches the common "user stashed `tx` somewhere and used it
+  later" bug without changing transaction semantics.
+
+### Changed
+
+- Roadmap shift (per a goals check-in mid-session):
+  - **v0.6.0** = `AbortSignal` cancellation (was v0.5; architecture
+    spiked + RFC-documented in v0.4.1; implementation deferred to
+    prioritize core-driver polish)
+  - **v0.7.0** = Windows x86_64 (was v0.6)
+
+### Not landing in v0.5
+
+- **Nested transactions via SAVEPOINT.** DuckDB v1.5.2 (our pinned
+  version) doesn't parse SAVEPOINT — it's an open upstream feature
+  request. `tx.transaction()` still rejects with
+  `DuckDBTransactionError`, now with a message that names the
+  upstream blocker. The method is *kept* on the public API (not
+  removed) so a future release that lands nested transactions is a
+  non-breaking change.
+- **Configurable type conversion** (BIGINT → bigint, etc.). Deferred
+  to a future RFC alongside the cancellation work — it changes the
+  decoder contract and wants a coherent options-bag design.
+
+### Internal
+
+- New FFI bindings: `duckdb_open_ext`, `duckdb_create_config`,
+  `duckdb_set_config`, `duckdb_destroy_config`.
+- Private SQL escape helpers (`assertSimpleIdentifier`,
+  `quoteSqlLiteral`) — not exported; used only by PRAGMA / extension
+  / SAVEPOINT-name generation.
+- `makeTxnHandle(conn, scope)` — module-level helper that builds the
+  scoped transaction wrapper. The scope's `closed` flag is flipped
+  before COMMIT/ROLLBACK so a leaked handle reference can't get used
+  mid-cleanup.
+
+### Tests
+
+- New `test/options.test.mjs` — 25 tests covering OpenOptions
+  (typed/typed conflict, typed/config conflict, validation, file-
+  backed read-only enforcement), PRAGMA helper (get/set, identifier
+  injection rejection, SQL escape), extension helpers (validation +
+  graceful error from missing extension), and `chunks()` on
+  Statement / Connection / Database (multi-chunk span, metadata
+  shape, concurrent guard, mid-stream cleanup).
+- Updated `test/transactions.test.mjs` — replaced the v0.4 "nested
+  throws" tests with new ones pinning the TxnHandle close-on-callback-
+  return behavior. The nested-throw test stays in a focused form
+  asserting the upstream-SAVEPOINT message.
+- 7 new async tests for OpenOptions parity (threads, readOnly, bad-
+  opts caching), pragma/extension via the worker, and `db.chunks`
+  buffering.
+- Total: 221 tests (was 186). Suite runs in ~2.6s.
+
 ## 0.4.1 — 2026-05-15
 
 Patch release: forward-compat plumbing for v0.5 cancellation, iterator

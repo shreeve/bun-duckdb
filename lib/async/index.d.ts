@@ -7,11 +7,12 @@
 
 import type {
   Row, Params, QueryResult, RunResult, AppendResult,
-  ColumnInfo,
+  ColumnInfo, OpenOptions, RowChunk, TxnHandle,
 } from '../duckdb.d.ts';
 
 export type {
   Row, Params, QueryResult, RunResult, AppendResult, ColumnInfo,
+  OpenOptions, RowChunk, TxnHandle,
 };
 
 // Re-export the error classes — they have the same identities as the
@@ -26,8 +27,7 @@ export class DuckDBWorkerCrashedError extends Error {
   readonly name: 'DuckDBWorkerCrashedError';
 }
 
-/** Reserved for v0.4.x. */
-export interface OpenOptions {}
+// OpenOptions is re-exported from '../duckdb.d.ts' above (v0.5+ shape).
 
 /** Options for streaming iteration. */
 export interface IterateOptions {
@@ -64,6 +64,18 @@ export class AsyncDatabase {
     sql: string, params?: Params, opts?: IterateOptions,
   ): AsyncIterableIterator<T>;
 
+  /** Stream rows chunk-by-chunk. (v0.5+) */
+  chunks<T extends Row = Row>(sql: string, params?: Params): AsyncIterableIterator<RowChunk<T>>;
+
+  /** Run `PRAGMA name` (get) or `PRAGMA name=value` (set). (v0.5+) */
+  pragma(name: string, value?: string | number | boolean | bigint | null): Promise<Row | undefined>;
+
+  /** `INSTALL <name>` with strict identifier validation. (v0.5+) */
+  installExtension(name: string): Promise<void>;
+
+  /** `LOAD <name>` with strict identifier validation. (v0.5+) */
+  loadExtension(name: string): Promise<void>;
+
   transaction<R>(fn: (tx: AsyncConnection) => Promise<R>): Promise<R>;
 
   /** Sync — returns a proxy. The actual duckdb_connect happens lazily. */
@@ -96,6 +108,18 @@ export class AsyncConnection {
   iterate<T extends Row = Row>(
     sql: string, params?: Params, opts?: IterateOptions,
   ): AsyncIterableIterator<T>;
+
+  /** Stream rows chunk-by-chunk. (v0.5+) */
+  chunks<T extends Row = Row>(sql: string, params?: Params): AsyncIterableIterator<RowChunk<T>>;
+
+  /** Run `PRAGMA name` (get) or `PRAGMA name=value` (set). (v0.5+) */
+  pragma(name: string, value?: string | number | boolean | bigint | null): Promise<Row | undefined>;
+
+  /** `INSTALL <name>` with strict identifier validation. (v0.5+) */
+  installExtension(name: string): Promise<void>;
+
+  /** `LOAD <name>` with strict identifier validation. (v0.5+) */
+  loadExtension(name: string): Promise<void>;
 
   /**
    * Bulk insert via the Appender API. Two forms:
@@ -155,5 +179,5 @@ export class AsyncAppender {
 // Top-level
 // ============================================================================
 
-export function open(path: string): AsyncDatabase;
+export function open(path: string, opts?: OpenOptions): AsyncDatabase;
 export function version(): Promise<string>;

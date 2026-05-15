@@ -39,10 +39,19 @@ d('transactions', () => {
     expect(rows[0].n).toBe(1);
   });
 
-  test('nested transaction throws DuckDBTransactionError', async () => {
-    await expect(db.transaction(async (tx) => {
-      await tx.transaction(async () => { /* never reached */ });
-    })).rejects.toThrow(DuckDBTransactionError);
+  test('nested transactions throw DuckDBTransactionError (upstream SAVEPOINT pending)', async () => {
+    // DuckDB v1.5.2 doesn't parse SAVEPOINT; nested support is reserved
+    // for a future release. The tx.transaction() method is intentionally
+    // KEPT (not removed) so types stay stable and future support is a
+    // non-breaking addition.
+    let caught;
+    try {
+      await db.transaction(async (tx) => {
+        await tx.transaction(async () => { /* never reached */ });
+      });
+    } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(DuckDBTransactionError);
+    expect(caught.message).toMatch(/SAVEPOINT/);
   });
 
   test('after a rejected transaction, a new transaction works', async () => {
@@ -51,8 +60,6 @@ d('transactions', () => {
       throw new Error('first one');
     })).rejects.toThrow('first one');
 
-    // The connection's #inTransaction flag should have been cleared
-    // in the finally block, so this second transaction must succeed.
     const r = await db.transaction(async (tx) => {
       await tx.exec('INSERT INTO t VALUES (1)');
       return 'second worked';
@@ -65,10 +72,39 @@ d('transactions', () => {
     expect(r).toEqual({ count: 42, name: 'ok' });
   });
 
-  test('transaction passes the Connection as tx', async () => {
+  test('transaction passes a scoped TxnHandle as tx (NOT the Connection)', async () => {
     using conn = db.connect();
     let receivedTx;
-    await conn.transaction(async (tx) => { receivedTx = tx; });
-    expect(receivedTx).toBe(conn);
+    await conn.transaction(async (tx) => {
+      receivedTx = tx;
+      // The handle has the same shortcut methods as Connection.
+      expect(typeof tx.query).toBe('function');
+      expect(typeof tx.exec).toBe('function');
+      expect(typeof tx.transaction).toBe('function');
+      // The handle is NOT the Connection itself (different object).
+      expect(tx).not.toBe(conn);
+    });
+    // After the callback returns, the handle MUST reject on use.
+    await expect(receivedTx.exec('SELECT 1')).rejects.toThrow(DuckDBTransactionError);
+  });
+
+  test('TxnHandle.query/get/run all reject after the callback returns', async () => {
+    let stale;
+    await db.transaction(async (tx) => { stale = tx; });
+    await expect(stale.query('SELECT 1')).rejects.toThrow(DuckDBTransactionError);
+    await expect(stale.get('SELECT 1')).rejects.toThrow(DuckDBTransactionError);
+    await expect(stale.run('SELECT 1')).rejects.toThrow(DuckDBTransactionError);
+    await expect(stale.exec('SELECT 1')).rejects.toThrow(DuckDBTransactionError);
+  });
+
+  test('TxnHandle is closed even when the callback throws', async () => {
+    let stale;
+    try {
+      await db.transaction(async (tx) => {
+        stale = tx;
+        throw new Error('boom');
+      });
+    } catch { /* expected */ }
+    await expect(stale.exec('SELECT 1')).rejects.toThrow(DuckDBTransactionError);
   });
 });

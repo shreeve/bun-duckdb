@@ -68,11 +68,14 @@ d('thrown errors are typed correctly', () => {
     }
   });
 
-  test('nested transaction throws DuckDBTransactionError', async () => {
+  test('using a TxnHandle after its callback returned throws DuckDBTransactionError', async () => {
+    // v0.5+: nested transactions ARE supported (SAVEPOINT-based); the
+    // remaining failure mode is using a TxnHandle outside its lexical
+    // scope.
+    let stale;
+    await db.transaction(async (tx) => { stale = tx; });
     try {
-      await db.transaction(async (tx) => {
-        await tx.transaction(async () => {});
-      });
+      await stale.exec('SELECT 1');
       throw new Error('should have thrown');
     } catch (e) {
       expect(e).toBeInstanceOf(DuckDBError);
