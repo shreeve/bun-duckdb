@@ -4,15 +4,29 @@ All notable changes documented here. Versioning follows
 [semver](https://semver.org/) — `0.x` releases may make breaking changes
 between minor versions until the `1.0.0` API freeze.
 
-## Unreleased — planned 0.2.2
+## 0.2.2 — 2026-05-15
 
-Documentation-correctness patch. The public API surface didn't match
-what the code actually did in a few places — this release pulls them
-back into alignment and fixes one real data-corruption bug. Tag and
-publish with `git tag v0.2.2 && git push --tags` once you're ready.
+Install-fix patch. v0.2.1 shipped pre-built shims for the first time,
+but the macOS shim was unusable in practice — its `LC_RPATH` was
+empty, so `dlopen` couldn't resolve `@rpath/libduckdb.dylib` at load
+time and every `import` failed with `Library not loaded`. This
+release also rolls in a documentation-correctness pass and fixes one
+real data-corruption bug discovered while we were tightening the
+type-mapping tables.
 
 ### Fixed
 
+- **macOS shim now loads.** `lib/Makefile` now passes
+  `-Wl,-rpath,/opt/homebrew/lib -Wl,-rpath,/usr/local/lib
+  -Wl,-rpath,/usr/lib` when linking on Darwin (and the equivalent
+  paths on Linux). The DuckDB-shipped `libduckdb.dylib` records its
+  install_name as `@rpath/libduckdb.dylib`, so without these `LC_RPATH`
+  entries on the shim the loader had no anchor to substitute. With
+  the rpaths baked in, the shim resolves `libduckdb` at whichever
+  standard path the user installed it (Apple Silicon Homebrew, Intel
+  Homebrew, or system). Verified locally with `otool -l` showing
+  three `LC_RPATH` entries on the rebuilt shim. **All v0.2.1 macOS
+  users should upgrade to v0.2.2.**
 - **`Connection.executeBatchPrepared(sql, batches)` now actually
   exists.** The method was documented in README/`.d.ts`/CHANGELOG since
   v0.1, but the runtime only exposed it under its original (undocumented)
@@ -31,6 +45,16 @@ publish with `git tag v0.2.2 && git push --tags` once you're ready.
   comma-joined byte values), which silently corrupted the data. The
   README's parameter-binding table already advertised `Uint8Array →
   BLOB`, so this brings the runtime up to the documented contract.
+
+### CI / Release
+
+- `release.yml` restructured into three jobs: `build-shim-required`
+  (Linux x64, Linux arm64, darwin-arm64), `build-shim-optional`
+  (darwin-x64), and `publish` which depends only on the required
+  shims. The Intel-Mac job runs in parallel and never blocks the
+  publish — its shim ships in the tarball if it finishes by then,
+  otherwise the tarball ships without it. Solves the v0.2.1 problem
+  where a queued darwin-x64 runner blocked publish for hours.
 
 ### Changed
 

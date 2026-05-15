@@ -36,6 +36,9 @@ ifeq ($(UNAME_S),Linux)
   EXT            := so
   CFLAGS_PIC     := -fPIC
   LDFLAGS_SHARED := -shared
+  # Bake rpath entries so the shim can resolve libduckdb.so at the
+  # standard install paths the driver's findDuckDBLibrary() also checks.
+  LDFLAGS_RPATH  := -Wl,-rpath,/usr/local/lib -Wl,-rpath,/usr/lib
 endif
 
 ifeq ($(UNAME_S),Darwin)
@@ -43,6 +46,13 @@ ifeq ($(UNAME_S),Darwin)
   EXT            := dylib
   CFLAGS_PIC     := -fPIC
   LDFLAGS_SHARED := -dynamiclib
+  # CRITICAL: libduckdb.dylib (as shipped in libduckdb-osx-universal.zip)
+  # has its install_name set to @rpath/libduckdb.dylib. Without LC_RPATH
+  # entries on the shim, dlopen has nothing to substitute for @rpath and
+  # the shim fails to load with "Library not loaded: @rpath/libduckdb.dylib"
+  # at runtime. Bake both common Homebrew prefixes + /usr/lib so the shim
+  # finds libduckdb wherever the user installed it.
+  LDFLAGS_RPATH  := -Wl,-rpath,/opt/homebrew/lib -Wl,-rpath,/usr/local/lib -Wl,-rpath,/usr/lib
 endif
 
 # uname -m varies: x86_64 / amd64 → x64, aarch64 / arm64 → arm64
@@ -75,7 +85,7 @@ LIBDUCKDB ?= -lduckdb
 all: $(SHIM)
 
 $(SHIM): duckdb-shim.c
-	$(CC) $(CFLAGS_PIC) $(CFLAGS) $(LDFLAGS_SHARED) -o $@ $< $(LIBDUCKDB)
+	$(CC) $(CFLAGS_PIC) $(CFLAGS) $(LDFLAGS_SHARED) $(LDFLAGS_RPATH) -o $@ $< $(LIBDUCKDB)
 
 install: $(SHIM)
 	install -d $(PREFIX)/lib
