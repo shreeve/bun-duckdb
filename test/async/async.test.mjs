@@ -709,6 +709,40 @@ d('async pragma / extension / chunks', () => {
     expect(caught.message).toMatch(/extension name/);
   });
 
+  test('db.checkpoint() and db.checkpoint({force: true}) work via worker', async () => {
+    await using db = open(':memory:');
+    await db.checkpoint();
+    await db.checkpoint({ force: true });
+  });
+
+  test('db.checkpoint({database}) validates the identifier', async () => {
+    await using db = open(':memory:');
+    let caught;
+    try { await db.checkpoint({ database: 'aux; DROP' }); }
+    catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(DuckDBError);
+    expect(caught.message).toMatch(/database name/);
+  });
+
+  test('async checkpoint actually persists on a file-backed DB', async () => {
+    const path = `/tmp/duckdb-bun-async-ckpt-${Date.now()}.duckdb`;
+    try {
+      {
+        await using db = open(path);
+        await db.exec('CREATE TABLE t (n INT)');
+        await db.run('INSERT INTO t SELECT range FROM range(500)');
+        await db.checkpoint();
+      }
+      // Reopen and verify durability.
+      await using d2 = open(path);
+      const r = await d2.get('SELECT COUNT(*) AS n FROM t');
+      expect(Number(r.n)).toBe(500);
+    } finally {
+      try { (await import('fs')).unlinkSync(path); } catch {}
+      try { (await import('fs')).unlinkSync(path + '.wal'); } catch {}
+    }
+  });
+
   test('db.chunks yields buffered chunks', async () => {
     await using db = open(':memory:');
     await db.exec('CREATE TABLE t (n INT)');

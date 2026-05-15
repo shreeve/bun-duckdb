@@ -4,6 +4,37 @@ All notable changes documented here. Versioning follows
 [semver](https://semver.org/) — `0.x` releases may make breaking changes
 between minor versions until the `1.0.0` API freeze.
 
+## 0.5.1 — 2026-05-15
+
+Tiny follow-up to v0.5.0 fills in a missing affordance.
+
+### Added
+
+- **`checkpoint(opts?)`** on `Database`, `Connection`, `TxnHandle`,
+  `AsyncDatabase`, `AsyncConnection`. Sugar over DuckDB's
+  `CHECKPOINT` / `FORCE CHECKPOINT` / `CHECKPOINT name` /
+  `FORCE CHECKPOINT name`. Useful for flushing the WAL on file-backed
+  databases before process exit or after a large batch insert.
+
+  ```js
+  await db.checkpoint();
+  await db.checkpoint({ force: true });
+  await db.checkpoint({ database: 'aux' });          // for ATTACHed DBs
+  await db.checkpoint({ database: 'aux', force: true });
+  ```
+
+  The `database` field is strictly validated against
+  `^[A-Za-z_][A-Za-z0-9_]*$` so it's safe to pass user-supplied names.
+  Should have been in v0.5.0; missed because it wasn't in the original
+  roadmap.
+
+### Tests
+
+- 11 new tests: in-memory no-op, force form, file-backed durability
+  (insert → checkpoint → reopen → verify rowcount), identifier
+  validation, attached-DB target, TxnHandle integration, async parity.
+- Total: 232 tests (was 221).
+
 ## 0.5.0 — 2026-05-15
 
 Core-polish release. Reorders the roadmap after a "are we still on

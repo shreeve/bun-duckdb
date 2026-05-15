@@ -7,12 +7,12 @@
 
 import type {
   Row, Params, QueryResult, RunResult, AppendResult,
-  ColumnInfo, OpenOptions, RowChunk, TxnHandle,
+  ColumnInfo, OpenOptions, RowChunk, TxnHandle, CheckpointOptions,
 } from '../duckdb.d.ts';
 
 export type {
   Row, Params, QueryResult, RunResult, AppendResult, ColumnInfo,
-  OpenOptions, RowChunk, TxnHandle,
+  OpenOptions, RowChunk, TxnHandle, CheckpointOptions,
 };
 
 // Re-export the error classes — they have the same identities as the
@@ -76,6 +76,9 @@ export class AsyncDatabase {
   /** `LOAD <name>` with strict identifier validation. (v0.5+) */
   loadExtension(name: string): Promise<void>;
 
+  /** Flush the WAL via `CHECKPOINT` (or `FORCE CHECKPOINT`). (v0.5.1+) */
+  checkpoint(opts?: CheckpointOptions): Promise<void>;
+
   transaction<R>(fn: (tx: AsyncConnection) => Promise<R>): Promise<R>;
 
   /** Sync — returns a proxy. The actual duckdb_connect happens lazily. */
@@ -120,6 +123,9 @@ export class AsyncConnection {
 
   /** `LOAD <name>` with strict identifier validation. (v0.5+) */
   loadExtension(name: string): Promise<void>;
+
+  /** Flush the WAL via `CHECKPOINT` (or `FORCE CHECKPOINT`). (v0.5.1+) */
+  checkpoint(opts?: CheckpointOptions): Promise<void>;
 
   /**
    * Bulk insert via the Appender API. Two forms:

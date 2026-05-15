@@ -45,6 +45,20 @@ export interface OpenOptions {
   config?: Record<string, string | number | boolean | bigint>;
 }
 
+/** Options for `checkpoint()` (v0.5.1+). */
+export interface CheckpointOptions {
+  /**
+   * Emit `FORCE CHECKPOINT` — checkpoints even with active transactions
+   * present (they are ABORTed). Default: false.
+   */
+  force?: boolean;
+  /**
+   * Target a specific attached database by name (when you've used
+   * `ATTACH '...' AS aux`). Strictly validated as an identifier.
+   */
+  database?: string;
+}
+
 /** Yielded by `chunks()` iterators (v0.5+). */
 export interface RowChunk<T extends Row = Row> {
   /** Decoded rows for this chunk. Also exposes `.columns` (same as QueryResult). */
@@ -77,6 +91,7 @@ export interface TxnHandle {
   pragma(name: string, value?: string | number | boolean | bigint | null): Promise<Row | undefined>;
   installExtension(name: string): Promise<void>;
   loadExtension(name: string): Promise<void>;
+  checkpoint(opts?: CheckpointOptions): Promise<void>;
   append(table: string, columns: string[], rows: unknown[][]): Promise<AppendResult>;
   executeBatchPrepared(sql: string, batches: unknown[][]): Promise<AppendResult>;
   /** Always rejects with DuckDBTransactionError until upstream SAVEPOINT support lands. */
@@ -240,6 +255,9 @@ export class Database {
   /** `LOAD <name>` with strict identifier validation. (v0.5+) */
   loadExtension(name: string): Promise<void>;
 
+  /** Flush the WAL via `CHECKPOINT` (or `FORCE CHECKPOINT`). (v0.5.1+) */
+  checkpoint(opts?: CheckpointOptions): Promise<void>;
+
   /** Stream rows chunk-by-chunk (DuckDB vector ≈ 2048 rows per chunk). (v0.5+) */
   chunks<T extends Row = Row>(sql: string, params?: Params): AsyncIterableIterator<RowChunk<T>>;
 
@@ -324,6 +342,9 @@ export class Connection {
 
   /** `LOAD <name>` with strict identifier validation. (v0.5+) */
   loadExtension(name: string): Promise<void>;
+
+  /** Flush the WAL via `CHECKPOINT` (or `FORCE CHECKPOINT`). (v0.5.1+) */
+  checkpoint(opts?: CheckpointOptions): Promise<void>;
 
   /** Stream rows chunk-by-chunk. (v0.5+) */
   chunks<T extends Row = Row>(sql: string, params?: Params): AsyncIterableIterator<RowChunk<T>>;
