@@ -1,6 +1,6 @@
 {
   "name": "duckdb-bun",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Efficient DuckDB driver for Bun, using pure FFI",
   "type": "module",
   "sideEffects": false,

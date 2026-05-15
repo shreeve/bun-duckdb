@@ -7,19 +7,24 @@ name: release
 #
 # Job topology:
 #
-#   build-shim-required  (3-platform matrix: linux-x64, linux-arm64, darwin-arm64)
-#                         ↓ blocks
-#   build-shim-optional  (1-job: darwin-x64)         publish
-#                         (parallel; never blocks)     ↓
-#                                                    Pack + npm publish + GitHub release
+#   build-shim-required  (4 shims from 3 runners)
+#       linux-x64        → ubuntu-latest        → make TAGGED=1
+#       linux-arm64      → ubuntu-24.04-arm     → make TAGGED=1
+#       darwin-arm64     → macos-latest         → make TAGGED=1
+#       darwin-x64       → macos-latest         → make darwin-x64-from-arm64
+#                                                  (cross-compile via lipo + clang -arch x86_64)
+#                          ↓ all required
+#                       publish
 #
-# darwin-x64 lives in its own optional job because GitHub's macos-13
-# (Intel) runner pool is small enough to queue jobs for hours. We don't
-# want a wedged Intel runner to delay every release indefinitely. The
-# publish step downloads ALL artifacts in flight at that moment — if
-# darwin-x64 has finished by then, its shim ships in the tarball; if
-# not, the tarball ships without it and Intel-Mac users fall back to
-# `make -C lib` as documented in the README.
+# We deliberately avoid using GitHub's macos-13 (Intel) runner pool.
+# It's small enough that jobs sit queued for hours, which historically
+# blocked our publish step indefinitely. Instead, the macos-latest
+# (Apple Silicon) runner produces BOTH macOS shims: the native arm64
+# one and an x64 cross-compile via `make darwin-x64-from-arm64`. The
+# cross-compile downloads DuckDB's universal libduckdb release, lipo's
+# out the x86_64 slice, and links the shim with `clang -arch x86_64`.
+# Result is a bit-for-bit equivalent dylib to one built natively on
+# Intel — no Intel runner required.
 
 on:
   push:
@@ -83,46 +88,27 @@ jobs:
           sudo cp libduckdb/libduckdb.dylib "$BREW_PREFIX/lib/"
           sudo cp libduckdb/duckdb.h        "$BREW_PREFIX/include/" || true
 
-      - name: Build platform-tagged FFI shim
+      - name: Build platform-tagged FFI shim (native)
         run: make -C lib TAGGED=1
 
-      - name: Upload shim artifact
+      - name: Cross-compile darwin-x64 shim (Apple Silicon only)
+        # On the macos-latest runner, also produce the Intel-Mac shim
+        # via cross-compilation. Sidesteps GitHub's Intel runner queue
+        # entirely — see workflow header for rationale.
+        if: matrix.label == 'darwin-arm64'
+        run: |
+          make -C lib darwin-x64-from-arm64 DUCKDB_VERSION=${DUCKDB_VERSION}
+          file lib/libduckdb-shim-darwin-x64.dylib
+
+      - name: Upload native shim artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.shim_artifact }}
           path: lib/${{ matrix.shim_artifact }}
           retention-days: 1
 
-  # ============================================================
-  # Optional shim — runs in parallel; publish never waits on this
-  # ============================================================
-  build-shim-optional-darwin-x64:
-    name: build-shim darwin-x64 (optional)
-    runs-on: macos-13
-    timeout-minutes: 60
-    continue-on-error: true   # never fails the workflow regardless of outcome
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install libduckdb
-        run: |
-          set -euo pipefail
-          curl -fsSL -o libduckdb.zip \
-            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/libduckdb-osx-universal.zip"
-          unzip -q libduckdb.zip -d libduckdb
-          if [ -d /opt/homebrew ]; then
-            BREW_PREFIX=/opt/homebrew
-          else
-            BREW_PREFIX=/usr/local
-          fi
-          sudo mkdir -p "$BREW_PREFIX/lib" "$BREW_PREFIX/include"
-          sudo cp libduckdb/libduckdb.dylib "$BREW_PREFIX/lib/"
-          sudo cp libduckdb/duckdb.h        "$BREW_PREFIX/include/" || true
-
-      - name: Build platform-tagged FFI shim
-        run: make -C lib TAGGED=1
-
-      - name: Upload shim artifact
+      - name: Upload cross-compiled darwin-x64 shim artifact
+        if: matrix.label == 'darwin-arm64'
         uses: actions/upload-artifact@v4
         with:
           name: libduckdb-shim-darwin-x64.dylib
@@ -130,7 +116,7 @@ jobs:
           retention-days: 1
 
   # ============================================================
-  # Publish — depends ONLY on required shims; uses optional if available
+  # Publish — bundles all 4 shims, publishes to npm, makes GH release
   # ============================================================
   publish:
     needs: build-shim-required
@@ -153,44 +139,41 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       - name: Download shim artifacts
-        # Pulls every artifact uploaded so far across the run. If
-        # build-shim-optional-darwin-x64 has finished by now its shim
-        # is included; if not, the staging step ships without it.
         uses: actions/download-artifact@v4
         with:
           path: lib-shims
 
       - name: Stage shims into lib/
-        # Required shims (linux-x64, linux-arm64, darwin-arm64) must all
-        # be present — publish fails otherwise. The darwin-x64 shim is
-        # best-effort.
+        # All 4 shims are now required — darwin-x64 comes from the
+        # macos-latest runner via cross-compile, so we don't depend on
+        # the Intel queue anymore.
         run: |
-          set -uo pipefail   # NOT -e: optional-missing path must not fail
+          set -euo pipefail
 
           stage() {
             local name=$1
-            local required=$2
             local src="lib-shims/$name/$name"
             if [ -f "$src" ]; then
               cp "$src" lib/
               echo "  ✅ staged $name"
-            elif [ "$required" = "required" ]; then
+            else
               echo "::error::Required shim $name was not produced."
               exit 1
-            else
-              echo "::warning::Optional shim $name not available — tarball will ship without it."
-              echo "  ⚠ skipped $name (Intel-Mac users will need to \`make -C lib\`)"
             fi
           }
 
-          stage libduckdb-shim-linux-x64.so       required
-          stage libduckdb-shim-linux-arm64.so     required
-          stage libduckdb-shim-darwin-arm64.dylib required
-          stage libduckdb-shim-darwin-x64.dylib   optional
+          stage libduckdb-shim-linux-x64.so
+          stage libduckdb-shim-linux-arm64.so
+          stage libduckdb-shim-darwin-arm64.dylib
+          stage libduckdb-shim-darwin-x64.dylib
 
           echo
           echo "=== final lib/ contents ==="
-          ls -lh lib/libduckdb-shim-* 2>&1 || echo "(none)"
+          ls -lh lib/libduckdb-shim-*
+          echo
+          echo "=== shim arch verification ==="
+          file lib/libduckdb-shim-darwin-arm64.dylib
+          file lib/libduckdb-shim-darwin-x64.dylib
 
       - name: Verify package version matches tag
         run: |

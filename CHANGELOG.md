@@ -4,6 +4,36 @@ All notable changes documented here. Versioning follows
 [semver](https://semver.org/) — `0.x` releases may make breaking changes
 between minor versions until the `1.0.0` API freeze.
 
+## 0.2.3 — 2026-05-15
+
+Intel-Mac (`darwin-x64`) shim now ships in the tarball, completing
+the four-platform pre-built shim coverage promised since v0.2.1.
+
+### Added
+
+- **`lib/libduckdb-shim-darwin-x64.dylib`** is now bundled in the npm
+  package. Intel-Mac users no longer need to run `make -C lib` after
+  install — `bun add duckdb-bun` is everything you need on every
+  supported platform now.
+
+### CI
+
+- New `make darwin-x64-from-arm64` target cross-compiles the Intel
+  shim from any macOS host. Downloads DuckDB's universal libduckdb
+  release, extracts the x86_64 slice with `lipo`, and links the shim
+  with `clang -arch x86_64`. Result is a bit-for-bit equivalent dylib
+  to one built natively on Intel.
+- `release.yml` now produces the darwin-x64 shim from the macos-latest
+  (Apple Silicon) runner via the cross-compile target, instead of
+  spinning a separate macos-13 (Intel) job. GitHub's Intel runner
+  pool is small enough to queue for hours; cross-compile sidesteps
+  that entirely. Publish typically completes in 5–10 minutes now,
+  with all four platform shims included.
+- `test.yml` matrix shrunk back to 3 entries (linux-x64, linux-arm64,
+  darwin-arm64). x86_64 coverage comes from release.yml's cross-
+  compile path. If a future cross-compile vs. native runtime
+  difference is suspected, add a one-off macos-13 smoke job back.
+
 ## 0.2.2 — 2026-05-15
 
 Install-fix patch. v0.2.1 shipped pre-built shims for the first time,

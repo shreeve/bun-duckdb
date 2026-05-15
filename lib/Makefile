@@ -87,6 +87,48 @@ all: $(SHIM)
 $(SHIM): duckdb-shim.c
 	$(CC) $(CFLAGS_PIC) $(CFLAGS) $(LDFLAGS_SHARED) $(LDFLAGS_RPATH) -o $@ $< $(LIBDUCKDB)
 
+# ---------------------------------------------------------------------------
+# Cross-compile darwin-x64 shim from a macOS host (typically Apple Silicon).
+#
+# GitHub's Intel macos-13 runner pool is small enough to queue jobs for
+# hours, which historically held up our publish step. This target sidesteps
+# that entirely by producing a native x86_64 shim from any macOS runner:
+# downloads the official universal libduckdb release, extracts the x86_64
+# slice with lipo, then compiles with clang -arch x86_64. Result is a
+# bit-for-bit equivalent dylib to one built natively on Intel.
+#
+# Output: libduckdb-shim-darwin-x64.dylib (always platform-tagged).
+#
+# Usage: make darwin-x64-from-arm64                  (uses pinned DuckDB version)
+#        make darwin-x64-from-arm64 DUCKDB_VERSION=v1.5.3
+# ---------------------------------------------------------------------------
+
+DUCKDB_VERSION ?= v1.5.2
+SHIM_DARWIN_X64 := libduckdb-shim-darwin-x64.dylib
+
+darwin-x64-from-arm64:
+	@if [ "$(PLATFORM)" != "darwin" ]; then \
+		echo "ERROR: darwin-x64-from-arm64 must run on macOS (host is $(PLATFORM))"; \
+		exit 1; \
+	fi
+	@TMP=$$(mktemp -d) && trap "rm -rf $$TMP" EXIT && \
+	  cd $$TMP && \
+	  echo "→ downloading libduckdb $(DUCKDB_VERSION) universal" && \
+	  curl -fsSL -o lib.zip \
+	    "https://github.com/duckdb/duckdb/releases/download/$(DUCKDB_VERSION)/libduckdb-osx-universal.zip" && \
+	  unzip -q lib.zip && \
+	  echo "→ extracting x86_64 slice from universal libduckdb" && \
+	  lipo libduckdb.dylib -extract x86_64 -output libduckdb-x64.dylib && \
+	  mv libduckdb-x64.dylib libduckdb.dylib && \
+	  cd "$(CURDIR)" && \
+	  echo "→ cross-compiling shim ($(SHIM_DARWIN_X64))" && \
+	  $(CC) -arch x86_64 $(CFLAGS_PIC) $(CFLAGS) -I$$TMP \
+	    $(LDFLAGS_SHARED) $(LDFLAGS_RPATH) \
+	    -o $(SHIM_DARWIN_X64) duckdb-shim.c -L$$TMP -lduckdb && \
+	  echo "→ verify:" && \
+	  file $(SHIM_DARWIN_X64) && \
+	  otool -l $(SHIM_DARWIN_X64) | grep -A 1 LC_RPATH
+
 install: $(SHIM)
 	install -d $(PREFIX)/lib
 	install -m 0755 $(SHIM) $(PREFIX)/lib/
@@ -98,4 +140,4 @@ clean:
 print-platform:
 	@echo "PLATFORM=$(PLATFORM) ARCH=$(ARCH) EXT=$(EXT) SHIM=$(SHIM)"
 
-.PHONY: all install clean print-platform
+.PHONY: all install clean print-platform darwin-x64-from-arm64
