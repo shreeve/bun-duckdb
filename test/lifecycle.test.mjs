@@ -24,7 +24,7 @@ d('Database', () => {
   });
 
   test('open() with on-disk path works', () => {
-    const path = `/tmp/bun-duckdb-test-${Date.now()}.duckdb`;
+    const path = `/tmp/duckdb-bun-test-${Date.now()}.duckdb`;
     const d2 = open(path);
     expect(d2).toBeTruthy();
     d2.close();

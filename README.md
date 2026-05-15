@@ -1,10 +1,10 @@
-# bun-duckdb
+# duckdb-bun
 
-[![npm version](https://img.shields.io/npm/v/bun-duckdb.svg)](https://www.npmjs.com/package/bun-duckdb)
+[![npm version](https://img.shields.io/npm/v/duckdb-bun.svg)](https://www.npmjs.com/package/duckdb-bun)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bun ≥1.0](https://img.shields.io/badge/Bun-%E2%89%A51.0-black?logo=bun)](https://bun.sh)
 [![DuckDB](https://img.shields.io/badge/DuckDB-%E2%89%A51.0-yellow?logo=duckdb)](https://duckdb.org)
-[![CI](https://github.com/shreeve/bun-duckdb/actions/workflows/test.yml/badge.svg)](https://github.com/shreeve/bun-duckdb/actions/workflows/test.yml)
+[![CI](https://github.com/shreeve/duckdb-bun/actions/workflows/test.yml/badge.svg)](https://github.com/shreeve/duckdb-bun/actions/workflows/test.yml)
 [![TypeScript](https://img.shields.io/badge/TypeScript-ready-3178C6?logo=typescript)](./lib/duckdb.d.ts)
 
 > Efficient DuckDB driver for Bun, using pure FFI
@@ -15,12 +15,12 @@ through `bun:ffi` and uses DuckDB's chunk-based result API for
 column-store reads with minimal overhead.
 
 ```bash
-bun add bun-duckdb
+bun add duckdb-bun
 brew install duckdb        # or: apt install libduckdb-dev
 ```
 
 ```js
-import { open } from 'bun-duckdb';
+import { open } from 'duckdb-bun';
 
 using db = open(':memory:');                     // closes automatically
 
@@ -57,9 +57,9 @@ await db.transaction(async (tx) => {
 
 | You're on... | You want... | Use |
 |---|---|---|
-| **Bun** | Embedded DuckDB, zero install friction | **`bun-duckdb`** (this package) |
-| **Bun** | A query builder layered on top | `bun-duckdb` + Kysely/Drizzle (when those add support) |
-| **Bun** | Multi-tenant DuckDB via HTTP | `bun-duckdb` + a thin HTTP wrapper, or [duckdb-harbor] (separate project) |
+| **Bun** | Embedded DuckDB, zero install friction | **`duckdb-bun`** (this package) |
+| **Bun** | A query builder layered on top | `duckdb-bun` + Kysely/Drizzle (when those add support) |
+| **Bun** | Multi-tenant DuckDB via HTTP | `duckdb-bun` + a thin HTTP wrapper, or [duckdb-harbor] (separate project) |
 | **Node** | Embedded DuckDB | [`@duckdb/node-api`](https://www.npmjs.com/package/@duckdb/node-api) (official) |
 | **Browser** | DuckDB in WebAssembly | [`@duckdb/duckdb-wasm`](https://www.npmjs.com/package/@duckdb/duckdb-wasm) |
 
@@ -73,9 +73,9 @@ await db.transaction(async (tx) => {
 | `@duckdb/duckdb-wasm` | Browser-only — full DuckDB inside a 6 MB Wasm module is overkill for server-side Bun |
 | `node-duckdb` (older) | Abandoned, last release before the chunk API |
 
-`bun-duckdb` is built around four properties Bun developers actually want:
+`duckdb-bun` is built around four properties Bun developers actually want:
 
-- **Pure FFI, no native build.** `bun add bun-duckdb` installs a
+- **Pure FFI, no native build.** `bun add duckdb-bun` installs a
   ~50 KB JS file. No `gyp` step, no platform binaries to compile. The
   only native dependency is `libduckdb` itself, which you install once
   via your package manager (`brew install duckdb`,
@@ -98,11 +98,11 @@ await db.transaction(async (tx) => {
 ## Install
 
 ```bash
-bun add bun-duckdb
+bun add duckdb-bun
 ```
 
 You also need `libduckdb` (the DuckDB shared library) installed
-somewhere `bun-duckdb` can find it. Common locations checked
+somewhere `duckdb-bun` can find it. Common locations checked
 automatically:
 
 ```
@@ -147,7 +147,7 @@ for details.
 
 **For npm users (the common case):** the shim is **pre-built and
 shipped in the package** for the four major platforms. `bun add
-bun-duckdb` is everything you need to install — no `make` step, no
+duckdb-bun` is everything you need to install — no `make` step, no
 toolchain dependency.
 
 | Platform | Shim shipped? |
@@ -181,7 +181,7 @@ Override the search with `DUCKDB_SHIM_PATH=/path/to/libduckdb-shim.so`.
 ## Quick start
 
 ```js
-import { open, version } from 'bun-duckdb';
+import { open, version } from 'duckdb-bun';
 
 console.log(version());  // → DuckDB version string
 
@@ -225,7 +225,7 @@ Type declarations ship with the package — `import` works in TS without
 extra setup, and `db.query<T>(sql)` lets you narrow the row shape:
 
 ```ts
-import { open, type QueryResult, type Statement } from 'bun-duckdb';
+import { open, type QueryResult, type Statement } from 'duckdb-bun';
 
 interface User { id: number; name: string }
 
@@ -345,7 +345,7 @@ common failure modes:
 | `DuckDBTransactionError` | Nested transactions (planned for v0.3 via SAVEPOINT) |
 
 ```js
-import { DuckDBError, DuckDBClosedError } from 'bun-duckdb';
+import { DuckDBError, DuckDBClosedError } from 'duckdb-bun';
 
 try {
   await stmt.run([1]);
@@ -456,7 +456,7 @@ SQL casts: `'SELECT CAST(? AS UINTEGER)'`.
   mechanism, not a true off-thread runner — long-running analytical
   queries still block the Bun event loop while they execute. For a
   truly off-thread interface, use a Web Worker today, or wait for
-  the forthcoming `bun-duckdb/async` subpath. See Roadmap.
+  the forthcoming `duckdb-bun/async` subpath. See Roadmap.
 
 ## Examples
 
@@ -484,7 +484,7 @@ SQL casts: `'SELECT CAST(? AS UINTEGER)'`.
 
 - [x] **Pre-built shim binaries** for Linux x64 / Linux arm64 /
       macOS x64 / macOS arm64 bundled into the npm tarball.
-      `bun add bun-duckdb` is now zero-friction install — no `make`
+      `bun add duckdb-bun` is now zero-friction install — no `make`
       step required.
 - [x] CI runs the full test suite + smokes the examples on all four
       platforms on every push.
@@ -502,9 +502,9 @@ SQL casts: `'SELECT CAST(? AS UINTEGER)'`.
 - [ ] Configurable type conversion — opt-in `DECIMAL → string` mode
       to preserve precision past 15 digits
 
-### v0.4.0 — `bun-duckdb/async` (Worker-backed)
+### v0.4.0 — `duckdb-bun/async` (Worker-backed)
 
-- [ ] `import { open } from 'bun-duckdb/async'` — same API surface
+- [ ] `import { open } from 'duckdb-bun/async'` — same API surface
       but runs DuckDB in a Worker so analytical queries don't block
       the main event loop
 - [ ] `AbortSignal` support backed by `duckdb_interrupt()`
@@ -513,8 +513,8 @@ SQL casts: `'SELECT CAST(? AS UINTEGER)'`.
 
 - API freeze
 - Comprehensive docs site
-- Optional companion packages: `bun-duckdb-kysely` (dialect),
-  `bun-duckdb-drizzle` (adapter)
+- Optional companion packages: `duckdb-bun-kysely` (dialect),
+  `duckdb-bun-drizzle` (adapter)
 
 ### Explicitly not planned
 
@@ -531,8 +531,8 @@ The driver stays a driver. Higher layers belong in separate packages.
 ## Building from source
 
 ```bash
-git clone https://github.com/shreeve/bun-duckdb
-cd bun-duckdb
+git clone https://github.com/shreeve/duckdb-bun
+cd duckdb-bun
 bun install                  # no deps actually, just for lockfile
 bun test                     # requires libduckdb installed
 make -C lib                  # builds libduckdb-shim for current platform

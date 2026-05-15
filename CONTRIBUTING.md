@@ -1,4 +1,4 @@
-# Contributing to bun-duckdb
+# Contributing to duckdb-bun
 
 Thanks for considering a contribution. This driver tries to stay small,
 honest, and maintainable. The goals below should make most decisions
@@ -7,8 +7,8 @@ obvious; the rest is taste.
 ## Quick start
 
 ```bash
-git clone https://github.com/shreeve/bun-duckdb
-cd bun-duckdb
+git clone https://github.com/shreeve/duckdb-bun
+cd duckdb-bun
 
 # DuckDB is a runtime requirement (not bundled).
 brew install duckdb              # macOS
@@ -52,8 +52,8 @@ If `libduckdb` isn't installed, `bun test` skips cleanly via
 - **Every PR adds at least one test.** Tests live by topic in `test/`,
   not by code module.
 - **No ORM features.** This is a driver. Models, migrations, query
-  builders belong in companion packages (`bun-duckdb-kysely`,
-  `bun-duckdb-drizzle`, etc.).
+  builders belong in companion packages (`duckdb-bun-kysely`,
+  `duckdb-bun-drizzle`, etc.).
 - **Update CHANGELOG.md** in the same PR as user-visible changes.
 - **Document any FFI workarounds.** When you add a binding for a new
   DuckDB function, leave a comment if the FFI declaration deviates
@@ -79,7 +79,7 @@ If `libduckdb` isn't installed, `bun test` skips cleanly via
 Please include:
 
 - Bun version (`bun --version`)
-- DuckDB version (`bun -e 'import { version } from "bun-duckdb"; console.log(version())'`)
+- DuckDB version (`bun -e 'import { version } from "duckdb-bun"; console.log(version())'`)
 - OS + architecture (e.g. `macOS arm64`, `Linux x86_64`)
 - A minimal reproducer (an `examples/`-style script that triggers the bug)
 - Stack trace or expected vs actual behavior

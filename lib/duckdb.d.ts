@@ -1,4 +1,4 @@
-// TypeScript declarations for bun-duckdb v0.2
+// TypeScript declarations for duckdb-bun v0.2
 //
 // Hand-written. Mirrors lib/duckdb.mjs's runtime API. Generic parameters
 // let users tighten row shapes when they know them; defaults are loose

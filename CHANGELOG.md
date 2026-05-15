@@ -8,7 +8,7 @@ between minor versions until the `1.0.0` API freeze.
 
 Install-friction patch. Pre-built shim binaries now ship in the npm
 tarball for Linux x64 / Linux arm64 / macOS x64 / macOS arm64 — no
-`make` step required after `bun add bun-duckdb`.
+`make` step required after `bun add duckdb-bun`.
 
 ### Added
 

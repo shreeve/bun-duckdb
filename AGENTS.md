@@ -1,4 +1,4 @@
-# AI Agent Guide for bun-duckdb
+# AI Agent Guide for duckdb-bun
 
 For human-facing docs, see [README.md](./README.md). This guide
 covers the implementation architecture, the load-bearing FFI
@@ -8,9 +8,9 @@ workarounds, and conventions for extending the driver.
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│ bun-duckdb consumer code (Bun process)               │
+│ duckdb-bun consumer code (Bun process)               │
 │                                                      │
-│   import { open } from 'bun-duckdb';                 │
+│   import { open } from 'duckdb-bun';                 │
 │   const db = open(':memory:');                       │
 │   const conn = db.connect();                         │
 │   conn.query('SELECT 42');                           │

@@ -1,5 +1,5 @@
 {
-  "name": "bun-duckdb",
+  "name": "duckdb-bun",
   "version": "0.2.1",
   "description": "Efficient DuckDB driver for Bun, using pure FFI",
   "type": "module",
@@ -48,12 +48,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/shreeve/bun-duckdb.git"
+    "url": "git+https://github.com/shreeve/duckdb-bun.git"
   },
   "bugs": {
-    "url": "https://github.com/shreeve/bun-duckdb/issues"
+    "url": "https://github.com/shreeve/duckdb-bun/issues"
   },
-  "homepage": "https://github.com/shreeve/bun-duckdb#readme",
+  "homepage": "https://github.com/shreeve/duckdb-bun#readme",
   "engines": {
     "bun": ">=1.0.0"
   },
