@@ -1,6 +1,8 @@
 // OpenOptions, pragma/extension helpers, and chunks() — v0.5 features.
 
 import { test, expect, beforeEach, afterEach } from 'bun:test';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { d, open, available, DuckDBError } from './helpers.mjs';
 
 let db;
@@ -29,17 +31,25 @@ d('OpenOptions', () => {
     // DuckDB doesn't allow read-only for `:memory:` (it has no
     // pre-existing data). Create a real file, populate it, close,
     // then reopen read-only and verify writes are rejected.
-    const path = `/tmp/duckdb-bun-readonly-${Date.now()}.duckdb`;
-    {
-      using d1 = open(path);
-      await d1.exec('CREATE TABLE t (n INT)');
-      await d1.run('INSERT INTO t VALUES (1)');
-    }
+    //
+    // Use explicit `await d1.close()` rather than `using d1` here:
+    // Symbol.dispose is fire-and-forget (the close() promise isn't
+    // awaited at scope exit), and on Windows we cannot reopen a file
+    // that's still open in the process. Async close ordering matters.
+    const path = join(tmpdir(), `duckdb-bun-readonly-${Date.now()}.duckdb`);
+    const d1 = open(path);
+    await d1.exec('CREATE TABLE t (n INT)');
+    await d1.run('INSERT INTO t VALUES (1)');
+    await d1.close();
     try {
-      using d2 = open(path, { readOnly: true });
-      const r = await d2.get('SELECT * FROM t');
-      expect(r.n).toBe(1);
-      await expect(d2.exec('INSERT INTO t VALUES (2)')).rejects.toThrow();
+      const d2 = open(path, { readOnly: true });
+      try {
+        const r = await d2.get('SELECT * FROM t');
+        expect(r.n).toBe(1);
+        await expect(d2.exec('INSERT INTO t VALUES (2)')).rejects.toThrow();
+      } finally {
+        await d2.close();
+      }
     } finally {
       try { (await import('fs')).unlinkSync(path); } catch {}
       try { (await import('fs')).unlinkSync(path + '.wal'); } catch {}
@@ -47,14 +57,17 @@ d('OpenOptions', () => {
   });
 
   test('explicit accessMode: READ_ONLY behaves the same', async () => {
-    const path = `/tmp/duckdb-bun-accessmode-${Date.now()}.duckdb`;
-    {
-      using d1 = open(path);
-      await d1.exec('CREATE TABLE t (n INT)');
-    }
+    const path = join(tmpdir(), `duckdb-bun-accessmode-${Date.now()}.duckdb`);
+    const d1 = open(path);
+    await d1.exec('CREATE TABLE t (n INT)');
+    await d1.close();
     try {
-      using d2 = open(path, { accessMode: 'READ_ONLY' });
-      await expect(d2.exec('INSERT INTO t VALUES (1)')).rejects.toThrow();
+      const d2 = open(path, { accessMode: 'READ_ONLY' });
+      try {
+        await expect(d2.exec('INSERT INTO t VALUES (1)')).rejects.toThrow();
+      } finally {
+        await d2.close();
+      }
     } finally {
       try { (await import('fs')).unlinkSync(path); } catch {}
       try { (await import('fs')).unlinkSync(path + '.wal'); } catch {}
@@ -192,21 +205,29 @@ d('checkpoint helper', () => {
 
   test('CHECKPOINT actually flushes WAL on a file-backed DB', async () => {
     const { existsSync, unlinkSync, statSync } = await import('fs');
-    const path = `/tmp/duckdb-bun-checkpoint-${Date.now()}.duckdb`;
+    const path = join(tmpdir(), `duckdb-bun-checkpoint-${Date.now()}.duckdb`);
     try {
-      using d2 = open(path);
+      const d2 = open(path);
       await d2.exec('CREATE TABLE t (n INT)');
       // Insert enough rows that the WAL is non-empty.
       await d2.run('INSERT INTO t SELECT range FROM range(1000)');
       // Before checkpoint there should be a .wal file (DuckDB writes
       // WAL during open transactions on file DBs).
       await d2.checkpoint();
+      // Must close (await!) before reopening — on Windows the file is
+      // exclusively locked while open. Symbol.dispose is fire-and-forget,
+      // so `using d2` would let the next open() race the close().
+      await d2.close();
       // After checkpoint, the WAL is truncated/removed. We don't assert
       // absence (DuckDB's exact WAL lifecycle isn't part of our
       // contract); we just verify the data is durable.
-      using d3 = open(path);
-      const c = await d3.get('SELECT COUNT(*) AS n FROM t');
-      expect(Number(c.n)).toBe(1000);
+      const d3 = open(path);
+      try {
+        const c = await d3.get('SELECT COUNT(*) AS n FROM t');
+        expect(Number(c.n)).toBe(1000);
+      } finally {
+        await d3.close();
+      }
     } finally {
       try { unlinkSync(path); } catch {}
       try { unlinkSync(path + '.wal'); } catch {}

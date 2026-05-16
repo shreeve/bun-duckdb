@@ -4,6 +4,83 @@ All notable changes documented here. Versioning follows
 [semver](https://semver.org/) — `0.x` releases may make breaking changes
 between minor versions until the `1.0.0` API freeze.
 
+## 0.6.0 — 2026-05-15
+
+**Windows x86_64 support.** First-class Windows port: pre-built shim
+DLL ships in the npm tarball, full test suite (232/232) and all five
+examples are green on `windows-latest` in CI.
+
+This is mechanically a small release — most of the work is the build
+pipeline and a handful of correctness fixes that were latent on Unix.
+
+### Added
+
+- **Shim:** `lib/libduckdb-shim-win32-x64.dll` built per release via
+  MSVC `cl.exe` and bundled into the npm tarball. The CI pipeline
+  verifies all required exports (`shim_fetch_chunk`,
+  `shim_result_get_chunk`, `shim_result_chunk_count`) via
+  `dumpbin /exports` to fail fast if `__declspec(dllexport)` is ever
+  dropped from the shim source.
+- **Build script:** `lib/build.ps1` — PowerShell build script that
+  produces the Windows shim from MSVC's `cl.exe`. Static-links the CRT
+  (`/MT`) so users don't need MSVC runtime installed; verifies exports
+  via `dumpbin` to fail fast if `__declspec(dllexport)` ever regresses.
+- **DLL discovery:** existing `findDuckDBLibrary()` Windows paths kept
+  (`C:\Program Files\DuckDB\duckdb.dll`, `duckdb.dll` on PATH), with
+  `DUCKDB_LIB_PATH` as the explicit override.
+- **CI:** `windows-latest` job in `test.yml` and `release.yml`, using
+  `ilammy/msvc-dev-cmd@v1` to provision MSVC.
+
+### Changed
+
+- **`lib/duckdb.mjs` cross-platform path handling:** replaced regex-
+  based dirname extraction (which only handled `/`) with `path.dirname` +
+  `url.fileURLToPath`. The previous code would fail on `C:\...\lib\
+  duckdb.mjs`.
+- **`lib/duckdb.mjs` dlopen handle retention:** both `dlopen()` wrapper
+  objects (libduckdb + shim) are now retained at module scope. Previously
+  we only kept `.symbols`. On Unix this was harmless; on Windows, GC of
+  the wrapper could trigger `FreeLibrary`, which would invalidate the
+  shim's bound import of `duckdb.dll`. Load order is also explicitly
+  documented (libduckdb first, then shim) — this is the "preload"
+  pattern that makes Windows's loader resolve the shim's import to the
+  already-loaded module by name.
+- **Shim source:** `__declspec(dllexport)` (under a `DUCKDB_BUN_EXPORT`
+  macro that's `__attribute__((visibility("default")))` on Unix). Without
+  this, `cl.exe /LD` produces a DLL with no exported symbols — Bun's
+  `dlopen` would silently return null entry points.
+- **`engines.bun` raised to `>= 1.1.0`** — Bun added Windows support in
+  1.1. The Linux/macOS path still works on 1.0, but npm metadata now
+  reflects the reality of what's tested.
+- **Test paths:** hardcoded `/tmp/...` replaced with
+  `os.tmpdir() + path.join(...)` in lifecycle / options / async tests.
+
+### Fixed
+
+- Three options tests (`readOnly`, `accessMode`, `checkpoint` file-
+  durability) previously used `using d1 = open(path)` to populate a
+  file, then immediately reopened the same path. On Windows the file is
+  exclusively locked while open and `Symbol.dispose` is fire-and-forget
+  (by design — `await using` is the awaitable version), so the second
+  open() raced the first close(). Switched to explicit `await close()`.
+  Behavior on Unix is unchanged.
+
+### Not shipping in 0.6.0
+
+- **Windows arm64 shim.** DuckDB ships a Windows arm64 binary and Bun
+  supports the platform, but we have no runtime test environment for
+  arm64 Windows in CI — compile-only support isn't enough for an FFI
+  package. Open an issue if you'd use it.
+
+### Roadmap shift
+
+- v0.6 was previously slated for `AbortSignal` cancellation; it's been
+  swapped with what was v0.7 (Windows). Cancellation is now planned for
+  v0.7. The cancellation architecture is already proven via the
+  forward-compat plumbing shipped in v0.4.1 (worker returns interrupt
+  handles per connection); the only missing piece is the main-thread
+  `AbortSignal` API.
+
 ## 0.5.2 — 2026-05-15
 
 Stabilization pass. **No public API changes, no behavior changes —

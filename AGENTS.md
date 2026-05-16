@@ -48,8 +48,9 @@ npm tarball. Source-clone contributors run `make -C lib` once.
 | `lib/async/index.mjs` | Main-thread proxies for the `duckdb-bun/async` subpath |
 | `lib/async/worker.mjs` | Worker dispatcher; imports `lib/duckdb.mjs` for actual FFI |
 | `lib/async/protocol.{mjs,d.ts}` | Wire protocol constants + types + shared error registry |
-| `lib/duckdb-shim.c` | C shim wrapping 3 DuckDB functions that take `duckdb_result` by value (Linux x64 ABI workaround) |
+| `lib/duckdb-shim.c` | C shim wrapping 3 DuckDB functions that take `duckdb_result` by value (Linux/Windows x64 ABI workaround) |
 | `lib/Makefile` | Builds `libduckdb-shim.{so,dylib}` (platform-tagged with `TAGGED=1` for CI) |
+| `lib/build.ps1` | Windows MSVC build script — produces `libduckdb-shim.dll` (or `libduckdb-shim-win32-x64.dll` with `-Tagged`) |
 | `test/*.test.mjs` | Bun-test files, split by topic; auto-skip when `libduckdb` is absent |
 | `test/async/async.test.mjs` | End-to-end tests for the async subpath |
 | `bench/async-vs-sync.mjs` | Benchmark harness comparing sync vs Worker paths |
@@ -92,14 +93,17 @@ lib.duckdb_connect(dbHandle, ptr(connBuf))  // dbHandle is a BigInt
 ### Bug 2: Struct-by-value passing is impossible
 
 `duckdb_fetch_chunk(duckdb_result result)` takes a 48-byte struct by
-value. On Linux x64 (SysV AMD64 ABI), this struct is classified as
-MEMORY and passed on the stack. Bun FFI has no mechanism to pass
-structs by value — passing `ptr(buf)` puts a pointer in a register
-where the callee expects 48 bytes on the stack.
+value. On Linux x64 (SysV AMD64 ABI) this struct is classified as
+MEMORY and passed on the stack. On Windows x64 (Microsoft x64 ABI),
+a 48-byte struct return is passed via a hidden first-pointer argument
+to caller-provided storage — also unrepresentable through Bun's FFI
+declarations. Bun FFI has no mechanism to pass structs by value;
+passing `ptr(buf)` puts a pointer in a register where the callee
+expects something else.
 
-On macOS arm64, large structs are passed by hidden pointer, so
-`ptr(buf)` as `'ptr'` happens to work. On Linux x64, it segfaults at
-`0x0`.
+On macOS arm64, large structs are passed by hidden pointer in r8, so
+`ptr(buf)` as `'ptr'` happens to work. On Linux x64 it segfaults at
+`0x0`; on Windows x64 it would corrupt the return value.
 
 **Fix:** A C shim (`lib/duckdb-shim.c`) wraps the by-value functions:
 
@@ -149,7 +153,79 @@ Or directly:
 gcc -shared -fPIC -o libduckdb-shim.so duckdb-shim.c -lduckdb
 ```
 
-Place next to `libduckdb.so`/`.dylib`, or set `DUCKDB_SHIM_PATH`.
+Windows uses a PowerShell + MSVC build instead:
+
+```powershell
+# from a Developer PowerShell for VS (or after running vcvars64.bat)
+cd lib
+.\build.ps1 -DuckDbDir C:\path\to\duckdb-windows-amd64
+# → libduckdb-shim.dll (or libduckdb-shim-win32-x64.dll with -Tagged)
+```
+
+Place next to `libduckdb.{so,dylib,dll}`, or set `DUCKDB_SHIM_PATH`.
+
+---
+
+## Windows-specific notes
+
+Three things are different on Windows. All of them are in
+`lib/duckdb.mjs` and `lib/duckdb-shim.c` already; don't re-discover
+them.
+
+### 1. DLL load order matters (preload pattern)
+
+The shim DLL has a static import dependency on `duckdb.dll`. Windows's
+OS loader resolves that dependency at the moment `dlopen(shimPath)` is
+called, NOT via our JS path discovery. The fix is to load `libduckdb`
+first by absolute path, then load the shim. Once a DLL by the name
+`duckdb.dll` is loaded into the process, the shim's import binds to
+the already-loaded module by name.
+
+The driver already does this. The order in `lib/duckdb.mjs` is:
+
+1. `ddbLib = dlopen(libPath, { ...duckdb symbols })` (retained module-scope)
+2. `shimLib = dlopen(shimPath, { ...shim symbols })` (also retained)
+
+Both objects MUST be retained at module scope, not just `.symbols`
+destructured. If Bun ever GCs the wrapper, it could call `FreeLibrary`
+on the underlying module — which on Windows would invalidate the
+shim's bound import. On Unix this is harmless, but the pattern is
+identical across platforms for simplicity.
+
+### 2. `__declspec(dllexport)` on shim functions
+
+On Linux/macOS, non-static C functions are visible to `dlsym` by
+default. On Windows, DLL functions are NOT exported unless they're
+marked with `__declspec(dllexport)`. The shim wraps this in a
+`DUCKDB_BUN_EXPORT` macro that's `__declspec(dllexport)` on Windows
+and `__attribute__((visibility("default")))` on Unix. If new shim
+functions are added, they MUST use this macro — otherwise `cl.exe /LD`
+produces a DLL that loads cleanly but has zero callable entry points,
+and Bun's `dlopen` silently returns null symbols.
+
+CI verifies this: `lib/build.ps1` runs `dumpbin /exports` on the built
+shim and asserts that all required symbols are present.
+
+### 3. Async close + file locking
+
+Windows enforces exclusive file locks on open DuckDB DBs. Tests that
+populate a file then immediately reopen the same path must `await
+close()` between the two opens — `Symbol.dispose` is fire-and-forget
+(it doesn't await the close() promise; that's by design — `await
+using` is the awaitable version), so naive `using db = open(path)`
+followed by `using db2 = open(path)` would race the close on Windows.
+
+The pattern in `test/options.test.mjs` is:
+
+```js
+const d1 = open(path);
+// ...populate...
+await d1.close();              // explicit, not `using`
+const d2 = open(path, opts);   // safe to reopen
+```
+
+`using` / `await using` still work fine for any DB whose file isn't
+reopened during its lifetime — which is the common case.
 
 ---
 

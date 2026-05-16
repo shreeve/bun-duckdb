@@ -160,7 +160,8 @@ Windows:  C:\Program Files\DuckDB\duckdb.dll
           duckdb.dll  (in PATH)
 ```
 
-Override with `DUCKDB_LIB_PATH=/your/path/libduckdb.so`.
+Override with `DUCKDB_LIB_PATH=/your/path/libduckdb.so` (on Windows:
+`$env:DUCKDB_LIB_PATH = "C:\path\to\duckdb.dll"`).
 
 ### Installing libduckdb
 
@@ -176,6 +177,17 @@ sudo dnf install libduckdb
 
 # Or download a release directly:
 #   https://github.com/duckdb/duckdb/releases
+```
+
+```powershell
+# Windows: no package manager — download the release zip and point
+# duckdb-bun at it via $env:DUCKDB_LIB_PATH.
+#
+#   https://github.com/duckdb/duckdb/releases  →  libduckdb-windows-amd64.zip
+#
+# Extract somewhere, then either:
+#   - put the directory on PATH so Windows's DLL loader finds duckdb.dll, or
+#   - set $env:DUCKDB_LIB_PATH = "C:\path\to\duckdb.dll" (preferred).
 ```
 
 ### FFI shim — what's it for
@@ -197,7 +209,7 @@ toolchain dependency.
 | **Linux arm64** | ✅ `lib/libduckdb-shim-linux-arm64.so` |
 | **macOS arm64 (Apple Silicon)** | ✅ `lib/libduckdb-shim-darwin-arm64.dylib` (also has a non-shim fallback that works on this platform) |
 | **macOS x86_64 (Intel)** | ✅ `lib/libduckdb-shim-darwin-x64.dylib` |
-| **Windows x86_64** | ⚠ Not yet — let us know if you try it |
+| **Windows x86_64** | ✅ `lib/libduckdb-shim-win32-x64.dll` (since v0.6.0) |
 
 The pre-built shims are produced per-platform by the [release
 workflow](./.github/workflows/release.yml) and bundled into the npm
@@ -584,16 +596,18 @@ benchmarks, and design notes), see [CHANGELOG.md](./CHANGELOG.md).
   scoped transaction handle that throws on use after callback.
 - **v0.5.1** — `checkpoint(opts?)` helper (CHECKPOINT /
   `FORCE CHECKPOINT` / named).
+- **v0.6.0** — Windows x86_64 support. Pre-built shim DLL (MSVC build
+  via `lib/build.ps1`), cross-platform path handling, `windows-latest`
+  CI job, `findDuckDBLibrary` Windows paths, `DUCKDB_LIB_PATH` env
+  override. Bun 1.1+ required on Windows.
 
 ### Planned
 
-- **v0.6** — `AbortSignal` per-query cancellation on the async subpath
+- **v0.7** — `AbortSignal` per-query cancellation on the async subpath
   (architecture proven: main thread calls `duckdb_interrupt` on the
   worker's connection handle while the worker is blocked in FFI).
   The sync subpath will not get `AbortSignal` — sync FFI blocks the
   JS thread that would receive the abort event.
-- **v0.7** — Windows x86_64. Pre-built shim binary (MSVC build), CI
-  matrix entry, `findDuckDBLibrary` Windows paths.
 - **v1.0** — API freeze. Optional companion packages
   (`duckdb-bun-kysely`, `duckdb-bun-drizzle`).
 
@@ -641,13 +655,16 @@ import fails and the test suite no-ops with `describe.skip`).
 
 ## Compatibility
 
-- **Bun:** ≥ 1.0
+- **Bun:** ≥ 1.1 (Bun added Windows support in 1.1; 1.0 still works on
+  Linux/macOS but the package now declares 1.1 as the minimum so the
+  npm metadata matches reality)
 - **DuckDB:** any modern release with the chunk API (≥ v0.10
   recommended; tested against v1.5.x)
 - **Platforms (shipped shims):** macOS arm64, macOS x64, Linux x64,
-  Linux arm64
-- **Windows:** planned for v0.7 (currently no shipped shim binary;
-  the package will fail to load on Windows today)
+  Linux arm64, Windows x64
+- **Windows arm64:** not shipped — compile-only support isn't
+  enough for a native/FFI package and we can't currently runtime-test
+  on Windows arm64 in CI. Open an issue if you'd use it.
 
 ## Related
 
