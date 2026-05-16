@@ -105,15 +105,17 @@ export interface OpenResult   { dbId: number }
  * Reply to a `connect` / `txnBegin` request.
  *
  * `interruptHandle` is the raw `duckdb_connection` pointer (cast to
- * `BigInt`). Reserved for the planned AbortSignal cancellation: the main thread will
- * dlopen `duckdb_interrupt` and call it with this handle to abort an
- * in-flight query while the worker is blocked in FFI. The handle is
- * never dereferenced from JavaScript on the main thread.
+ * `BigInt`). Used by AbortSignal cancellation (v0.7+): the main
+ * thread calls `duckdb_interrupt(handle)` via its own FFI binding to
+ * abort an in-flight query while the worker is blocked in FFI. The
+ * handle is never dereferenced from JavaScript on the main thread.
  *
- * `interruptGeneration` is a monotonic token that lets the main thread
- * invalidate stale references — if a `connId` is recycled after
- * `close()`, the new generation prevents an old `AbortSignal` from
- * firing `duckdb_interrupt` on the recycled connection.
+ * `interruptGeneration` is a monotonic token used as defense-in-depth
+ * against stale references — if a `connId` were ever recycled after
+ * `close()` (currently ids are monotonic, so this can't happen, but
+ * the token is cheap insurance), the new generation would prevent an
+ * old `AbortSignal` from firing `duckdb_interrupt` on the recycled
+ * connection.
  *
  * Both fields are optional for back-compat with v0.4.0 servers, where
  * they were not sent. v0.4.1+ workers always include them.
@@ -140,7 +142,8 @@ export interface AppendRowsResult   { rows: number }
 export interface AppendFlushResult  { rows: number }
 export interface TxnBeginResult {
   connId: number;
-  /** See ConnectResult.interruptHandle (forward-compat for v0.5). */
+  /** See ConnectResult.interruptHandle. Used by AbortSignal cancellation
+   *  (v0.7+) to interrupt sub-ops running inside the transaction. */
   interruptHandle?: bigint;
   interruptGeneration?: number;
 }

@@ -18,7 +18,7 @@ brew install duckdb              # macOS
 make -C lib
 
 # Run the test suite
-bun test                          # ~230 tests, ~2.5s
+bun test                          # ~245 tests, ~3s
 
 # Smoke the examples
 bun examples/basic.mjs
@@ -37,14 +37,14 @@ If `libduckdb` isn't installed, `bun test` skips cleanly via
 |---|---|
 | Main-thread driver | `lib/duckdb.mjs` (~2500 lines, single file) |
 | Async-subpath proxy | `lib/async/{index,worker,protocol}.{mjs,d.ts}` |
-| FFI shim source | `lib/duckdb-shim.c` (works around a Bun struct-by-value ABI bug) |
+| FFI shim source | `lib/duckdb-shim.c` (works around a Bun struct-by-value ABI bug); Windows MSVC build in `lib/build.ps1` |
 | TypeScript declarations | `lib/duckdb.d.ts`, `lib/async/*.d.ts` (hand-written) |
 | Tests, by topic | `test/{lifecycle,queries,statements,transactions,types,appender,errors,iterate,options}.test.mjs` |
-| Async tests | `test/async/async.test.mjs` |
+| Async tests | `test/async/{async,cancel}.test.mjs` |
 | Shared test setup | `test/helpers.mjs` |
 | Examples | `examples/*.mjs` |
-| Architecture notes | `AGENTS.md` (FFI bug knowledge, locking model, type contract — read this before any FFI work) |
-| Design RFCs | `docs/rfcs/` (the v0.4 async subpath was designed in `0001-worker-async-api.md` first) |
+| Architecture notes | `AGENTS.md` (FFI bug knowledge, locking model, type contract, Windows specifics, async cancellation — read this before any FFI work) |
+| Design RFCs | `docs/rfcs/` (the async subpath + cancellation were designed in `0001-worker-async-api.md` first) |
 
 ## Conventions
 

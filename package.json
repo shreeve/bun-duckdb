@@ -48,6 +48,7 @@
     "example:appender": "bun examples/appender.mjs",
     "example:iterate": "bun examples/iterate.mjs",
     "example:async": "bun examples/async.mjs",
+    "example:cancel": "bun examples/cancel.mjs",
     "bench:async": "bun bench/async-vs-sync.mjs"
   },
   "keywords": [

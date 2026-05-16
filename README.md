@@ -585,6 +585,7 @@ SQL casts: `'SELECT CAST(? AS UINTEGER)'`.
 - [`examples/appender.mjs`](./examples/appender.mjs) — 100k bulk insert via the Appender API
 - [`examples/iterate.mjs`](./examples/iterate.mjs) — streaming with `stmt.iterate()` / `conn.iterate()` / `db.iterate()`, early-break cleanup, parallel streams across two Connections *(v0.3+)*
 - [`examples/async.mjs`](./examples/async.mjs) — `duckdb-bun/async` Worker-backed subpath: same API, event loop stays responsive during heavy queries *(v0.4+)*
+- [`examples/cancel.mjs`](./examples/cancel.mjs) — `AbortSignal` cancellation patterns: mid-query cancel, `AbortSignal.timeout()`, pre-aborted signals, streaming iterator cancel, HTTP `request.signal` *(v0.7+)*
 
 ## Roadmap
 
@@ -649,8 +650,18 @@ benchmarks, and design notes), see [CHANGELOG.md](./CHANGELOG.md).
 - Migrations
 - Schema introspection beyond what DuckDB's `PRAGMA show_tables` /
   `DESCRIBE` already gives you
-- Connection pooling — DuckDB is in-process, pooling is the wrong
-  shape
+- **Connection pooling.** DuckDB is embedded — `db.connect()` is
+  cheap (microseconds, no network handshake), and there's no
+  server-side `max_connections` cap to ration. Pooling solves a
+  Postgres/MySQL problem we don't have. For parallelism, create as
+  many Connections as you need; for bounded concurrency, use a
+  semaphore in your own code; for statement reuse, use `db.prepare()`.
+  A pool abstraction would add acquire/release ceremony, leak
+  detection, and sizing config to "solve" a problem the underlying
+  primitive doesn't have.
+- Retry frameworks, circuit breakers, observability adapters —
+  general-purpose patterns, not DuckDB-specific. Compose them in
+  your own code.
 
 The driver stays a driver. Higher layers belong in separate packages.
 

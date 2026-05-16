@@ -526,19 +526,21 @@ d('Error reconstruction', () => {
 // ============================================================================
 
 // ============================================================================
-// Forward-compat for v0.5 cancellation (v0.4.1+)
+// Interrupt-handle plumbing (introduced v0.4.1, wired up for cancellation in v0.7)
 // ============================================================================
 //
-// The worker now sends `interruptHandle` (raw duckdb_connection BigInt)
+// The worker sends `interruptHandle` (raw duckdb_connection BigInt)
 // and `interruptGeneration` on every `connect` / `txnBegin` response.
-// The main proxy caches these in `_interruptHandles` keyed by connId.
-// v0.4.1 doesn't USE the handles; v0.5 will plug them into a main-
-// thread `duckdb_interrupt` path for AbortSignal cancellation.
+// The main proxy caches these in `_interruptHandles` keyed by connId,
+// then uses them in `#runSerial` to fire duckdb_interrupt on
+// AbortSignal abort (see test/async/cancel.test.mjs for the end-to-end
+// cancellation tests).
 //
-// These tests pin the plumbing so v0.5's implementation can rely on
-// the contract.
+// These tests pin the underlying plumbing — handle presence on connect,
+// generation freshness, removal on close — so the cancellation layer
+// can rely on the contract.
 
-d('v0.4.1 forward-compat: interrupt handle plumbing', () => {
+d('interrupt handle plumbing', () => {
   test('explicit connect() populates _interruptHandles', async () => {
     await using db = open(':memory:');
     using conn = db.connect();

@@ -2,24 +2,26 @@
 
 | Field | Value |
 |---|---|
-| Status | **Implemented in v0.4.0** (shipped 2026-05-15). Preserved here as a design archive. |
-| Target release | v0.4.0 |
+| Status | **Implemented.** Core async subpath in v0.4.0; AbortSignal cancellation (§16 #5) in v0.7.0. Preserved here as a design archive. |
+| Target release | v0.4.0 (subpath), v0.4.1 (interrupt-handle plumbing), v0.7.0 (cancellation wired up) |
 | Drafted | 2026-05-15 |
 | Reviewed | 2026-05-15 (Anthropic Opus 4.7 via `mcp/user-ai/discuss`; load-balanced from a GPT-5.5 conversation) |
 | Prerequisites | v0.3.0 shipped (`Statement.iterate()` semantics frozen) |
 
 ### Why this RFC still exists
 
-The `duckdb-bun/async` subpath has shipped — most of the
-implementation TODOs below are historical. The document is preserved
-as a design archive: future maintainers reading
-`lib/async/{index,worker,protocol}.mjs` can trace back to the
-decisions and trade-offs that produced the current shape.
+The `duckdb-bun/async` subpath has shipped and the AbortSignal
+cancellation it described has also shipped — every implementation
+TODO below is historical. The document is preserved as a design
+archive: future maintainers reading `lib/async/{index,worker,
+protocol}.mjs` can trace back to the decisions and trade-offs that
+produced the current shape.
 
-The one section that is still actively useful is **§16 #5
-(cancellation)** — the spike findings and architecture there describe
-the path for the planned v0.6 `AbortSignal` work. The rest of the
-document is for context.
+The §16 #5 spike data on `duckdb_interrupt` (interrupt latency, the
+main-thread-calls-on-worker-owned-handle pattern, generation tokens)
+is also useful background reading if you ever need to debug a
+cancellation race — `test/async/cancel.test.mjs` pins the
+ten invariants the design committed to.
 
 ### Changelog of this RFC
 
@@ -857,14 +859,16 @@ spiked or decided before approval.
    document the chosen default with one sentence of rationale.
 4. **Close timeout — RESOLVED.** Opt-in via `close({ timeout })`. No
    default. See §11.
-5. **`AbortSignal` / cancellation — RESOLVED (v0.5 with revised
-   architecture; v0.4.0 shipped without).** v0.5.0 adds it as the
-   headline feature; Windows slides to v0.6.0. **The "half-day"
-   scope estimate in this RFC's first draft was wrong** — a post-v0.4
-   spike (2026-05-15) proved the original implicit architecture
-   ("worker handles a `cancel` postMessage") cannot work, because
-   the worker's JS event loop is **completely blocked** during a
-   DuckDB FFI call. Concrete data:
+5. **`AbortSignal` / cancellation — IMPLEMENTED in v0.7.0.** Shipped
+   2026-05-15. The roadmap shifted from this RFC's draft: v0.5 was
+   core polish (OpenOptions, pragma/extension helpers, chunks,
+   TxnHandle), v0.5.1 added `checkpoint()`, v0.6.0 was Windows port,
+   v0.7.0 is cancellation. The architecture below is what shipped.
+   **The "half-day" scope estimate in this RFC's first draft was
+   wrong** — a post-v0.4 spike (2026-05-15) proved the original
+   implicit architecture ("worker handles a `cancel` postMessage")
+   cannot work, because the worker's JS event loop is **completely
+   blocked** during a DuckDB FFI call. Concrete data:
 
    ```
    Spike 1 — same-worker cancel:
@@ -889,33 +893,41 @@ spiked or decided before approval.
      Interrupt latency: 2ms
    ```
 
-   The v0.4.1 patch ships **forward-compat plumbing** for this
-   architecture without exposing any new public API:
+   The v0.4.1 patch shipped **interrupt-handle plumbing** without
+   exposing any new public API:
    - Worker's `connect`/`txnBegin` responses include `interruptHandle:
      bigint` (the raw `duckdb_connection` pointer) and
      `interruptGeneration: number` (monotonic, prevents stale abort
      listeners firing on a recycled connId).
    - Main proxy stores these in `AsyncDatabase._interruptHandles:
-     Map<connId, { ptr, generation }>` but never reads them.
+     Map<connId, { ptr, generation }>`.
    - The map is cleared on every `Connection.close()` and
      `Database.close()`.
 
-   v0.5 wiring (still to ship):
-   - Main thread dlopens just `duckdb_interrupt` (libduckdb is already
-     loaded by the sync subpath; reuse same library path).
-   - Every async query method accepts `{ signal: AbortSignal }`.
-   - **Critical correctness invariant** (per GPT-5.5 review): only
-     interrupt when the aborted request is **known to be active** on
-     its target connection. Worker emits a `requestActive` event
-     immediately before entering blocking FFI; main tracks
-     `activeRequestByConn: Map<connId, requestId>`. Without this,
-     aborting a queued request would interrupt a different request
-     that's currently active — a correctness bug.
-   - New error class: `DuckDBAbortError extends DuckDBError`.
+   v0.7.0 wired it up:
+   - Main thread binds `duckdb_interrupt` via the existing libduckdb
+     `dlopen` (no second dlopen needed; same library path).
+   - Every async query method accepts `{ signal?: AbortSignal }`.
+   - **Per-conn serialization on the main thread.** Each
+     `AsyncConnection` holds a promise chain; at most one op is in
+     flight per conn (matches the sync driver's per-conn lock). The
+     active op gets a unique token; the abort handler checks the
+     token before firing `duckdb_interrupt`. Without this, aborting
+     a queued request would interrupt a different request that's
+     currently active — a correctness bug.
+   - **`AsyncDatabase` shortcuts route through a lazy implicit
+     `AsyncConnection`.** Pre-v0.7 they used the sync driver's
+     implicit conn inside the worker (no main-thread handle); the
+     refactor gives db-level shortcuts a stable connection identity
+     for cancellation. Unifies what had been two divergent code paths.
+   - **`DuckDBAbortError extends DuckDBError`**, `name: 'AbortError'`
+     (Web standard convention used by fetch/ReadableStream),
+     `code: 'ERR_DUCKDB_ABORTED'`.
    - Iterator coordination: aborting mid-`iterNext` interrupts the
      active fetch; in-flight prefetch is drained; `iterReturn` is
      sent best-effort. Aborting between chunks (when no FFI is
-     active) marks the iterator aborted and next `.next()` rejects.
+     active) sets a flag; next `.next()` rejects with
+     `DuckDBAbortError`.
    - Transaction coordination: aborting a sub-op rejects with
      `DuckDBAbortError`; `runTransaction`'s catch path sends
      `txnRollback` **without** the user signal (cleanup must be
@@ -923,24 +935,29 @@ spiked or decided before approval.
    - **Sync subpath does NOT get `AbortSignal`** — sync FFI blocks
      the JS thread that would receive the abort event; shipping a
      signal that can't interrupt mid-FFI would be misleading.
-     Document that users needing cancellation use `duckdb-bun/async`;
      `close({ timeout })` is the only fallback for the sync subpath
      and is framed as a shutdown hammer, not equivalent to per-query
      cancellation.
 
-   **Revised scope (per GPT-5.5):** 1.5–2 days minimum for correct
-   semantics; 2–3 days with full polish (main-side request scheduler
-   for prompt queued-cancel, transaction-level signal, stress tests).
+   **Actual scope (v0.7.0):** ~90 minutes implementation + one CI
+   iteration. The pre-implementation review (1.5–2 day estimate per
+   GPT-5.5) was conservative because most of the work — the
+   `AsyncDatabase`-shortcut refactor through a lazy implicit
+   `AsyncConnection`, per-conn serialization, and active-request
+   tracking — fit cleanly on top of the v0.4.1 plumbing. 11 tests
+   in `test/async/cancel.test.mjs` pin the 10 invariants identified
+   in the pre-implementation review plus a bonus check for
+   `AsyncStatement.{all,get,run}`.
 
 ---
 
-## §17 · Scope discipline
+## §17 · Scope discipline (historical, for the v0.4.0 release)
 
-Things to **explicitly defer to v0.5+**:
+Things deferred past v0.4.0 (all have since shipped or remain
+explicitly out of scope):
 
-- `AbortSignal` / cancellation (now the headline feature of v0.5.0 —
-  see §16 item 5). Was previously slated for v0.5+; the reviewer
-  argued for v0.4 but the scope blew the budget.
+- `AbortSignal` / cancellation — **shipped in v0.7.0** (see §16
+  item 5).
 - Worker pooling (one Worker per Database stays)
 - Transferable optimization for result transport (benchmark first;
   may not be needed)
