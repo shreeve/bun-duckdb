@@ -244,6 +244,13 @@ make -C lib                       # → lib/libduckdb-shim.{so,dylib}
 make -C lib TAGGED=1              # → lib/libduckdb-shim-{platform}-{arch}.{so,dylib}
 ```
 
+The built shims are gitignored local artifacts — safe to delete any
+time; `make -C lib` regenerates them. On macOS arm64 the driver has
+a non-shim fallback (see [§ Compatibility](#compatibility) below),
+so the local test suite passes even without a built shim. On Linux
+and Windows the shim is required at runtime — that's why npm
+installs ship pre-built shims for every supported platform.
+
 The driver's `findShimLibrary()` searches in priority order: the
 `$DUCKDB_SHIM_PATH` env override, then the platform-tagged shim,
 then the untagged shim, then any shim next to `libduckdb` itself.
