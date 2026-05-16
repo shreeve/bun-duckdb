@@ -73,7 +73,7 @@ via the `duckdb-bun/async` subpath. Identical API surface, but every
 query runs off the main event loop, so the loop stays responsive:
 
 ```js
-import { open } from 'duckdb-bun/async';      // note: /async subpath
+import { open, DuckDBAbortError } from 'duckdb-bun/async';   // /async subpath
 
 await using db = open(':memory:');            // sync proxy; worker spawns lazily
 
@@ -85,19 +85,28 @@ const big = db.get('SELECT count(*) FROM range(1500000) a, range(80) b WHERE (a.
 const t = setInterval(() => console.log('tick'), 100);   // these still fire on time
 await big;
 clearInterval(t);
+
+// AbortSignal cancellation (v0.7+) — same shape as fetch():
+const ctl = new AbortController();
+setTimeout(() => ctl.abort(), 500);
+try {
+  await db.get('SELECT count(*) FROM range(5e9) a, range(200) b', undefined, { signal: ctl.signal });
+} catch (err) {
+  if (err instanceof DuckDBAbortError) console.log('canceled');
+  else throw err;
+}
 ```
 
 See [`examples/async.mjs`](./examples/async.mjs) for the full surface.
 
-> **Cancellation note (v0.5.x):** `AbortSignal` per-query cancellation
-> is planned for v0.6.0 on the async subpath only. The architecture is
-> proven (main thread calls `duckdb_interrupt` on the worker's
-> connection handle while the worker is blocked in FFI; interrupt
-> latency ~2ms). Until v0.6, the safety valve for hung queries is
-> `db.close({ timeout: ms })`, which terminates the whole Worker —
-> not a per-request primitive. The synchronous `duckdb-bun` API will
-> **not** get `AbortSignal` (sync FFI blocks the JS thread that would
-> receive the event); use `duckdb-bun/async` if you need cancellation.
+> **Cancellation: async only.** `AbortSignal` is supported on every
+> async op (query / exec / run / all / get / iterate / chunks /
+> Statement.\*); aborting fires `duckdb_interrupt` on the worker's
+> connection handle. The synchronous `duckdb-bun` API does **not**
+> support `AbortSignal` (sync FFI blocks the JS thread that would
+> receive the abort event). For sync code, the safety valve for hung
+> queries is `db.close({ timeout: ms })`, which terminates the whole
+> Worker — not a per-request primitive.
 
 ## Why
 
@@ -439,6 +448,7 @@ common failure modes:
 | `DuckDBPrepareError` | `prepare()` failed (typically a SQL syntax error) |
 | `DuckDBTransactionError` | Nested transactions (DuckDB does not yet support `SAVEPOINT`) or using a `TxnHandle` after its callback returned |
 | `DuckDBWorkerCrashedError` | (`duckdb-bun/async` only) Worker exited unexpectedly. All pending request promises reject with this; future calls on any proxy from that Database reject with `DuckDBClosedError`. |
+| `DuckDBAbortError` | (`duckdb-bun/async` only, v0.7+) Query was canceled via `AbortSignal`. `.name === 'AbortError'`, `.code === 'ERR_DUCKDB_ABORTED'`. Compatible with code that checks `err.name === 'AbortError'` (fetch / ReadableStream / similar). |
 
 ```js
 import { DuckDBError, DuckDBClosedError } from 'duckdb-bun';
@@ -609,14 +619,15 @@ benchmarks, and design notes), see [CHANGELOG.md](./CHANGELOG.md).
   via `lib/build.ps1`), cross-platform path handling, `windows-latest`
   CI job, `findDuckDBLibrary` Windows paths, `DUCKDB_LIB_PATH` env
   override. Bun 1.1+ required on Windows.
+- **v0.7.0** — `AbortSignal` per-query cancellation on the async
+  subpath. Every async op accepts `{ signal?: AbortSignal }`; aborts
+  fire `duckdb_interrupt` on the worker's connection handle. New
+  `DuckDBAbortError` class. AsyncDatabase shortcuts route through a
+  lazy implicit `AsyncConnection` for stable cancellation identity.
+  Per-conn serialization on the main thread.
 
 ### Planned
 
-- **v0.7** — `AbortSignal` per-query cancellation on the async subpath
-  (architecture proven: main thread calls `duckdb_interrupt` on the
-  worker's connection handle while the worker is blocked in FFI).
-  The sync subpath will not get `AbortSignal` — sync FFI blocks the
-  JS thread that would receive the abort event.
 - **v1.0** — API freeze. Optional companion packages
   (`duckdb-bun-kysely`, `duckdb-bun-drizzle`).
 

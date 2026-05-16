@@ -177,7 +177,9 @@ export type DuckDBTypeCode = (typeof DUCKDB_TYPE)[keyof typeof DUCKDB_TYPE];
 // ============================================================================
 
 export class DuckDBError extends Error {
-  readonly name: 'DuckDBError' | 'DuckDBClosedError' | 'DuckDBPrepareError' | 'DuckDBTransactionError';
+  readonly name:
+    | 'DuckDBError' | 'DuckDBClosedError' | 'DuckDBPrepareError'
+    | 'DuckDBTransactionError' | 'AbortError';
 }
 
 export class DuckDBClosedError extends DuckDBError {
@@ -190,6 +192,24 @@ export class DuckDBPrepareError extends DuckDBError {
 
 export class DuckDBTransactionError extends DuckDBError {
   readonly name: 'DuckDBTransactionError';
+}
+
+/**
+ * Raised when an async query is interrupted via AbortSignal (v0.7+).
+ *
+ * `.name` is `'AbortError'` (Web standard convention used by fetch /
+ * ReadableStream / similar) so code that keys on `err.name` to detect
+ * cancellation works without knowing about DuckDB specifics. The
+ * class itself is still a DuckDBError so `instanceof DuckDBError`
+ * is true.
+ *
+ * Only thrown by the `duckdb-bun/async` subpath — the sync subpath
+ * blocks the JS event loop in FFI, so it can't deliver AbortSignal
+ * events while a query runs.
+ */
+export class DuckDBAbortError extends DuckDBError {
+  readonly name: 'AbortError';
+  readonly code: 'ERR_DUCKDB_ABORTED';
 }
 
 // ============================================================================
