@@ -38,6 +38,10 @@ jobs:
             os: macos-latest
             duckdb_asset: libduckdb-osx-universal.zip
             shim_artifact: libduckdb-shim-darwin-arm64.dylib
+          - label: windows-x64
+            os: windows-latest
+            duckdb_asset: libduckdb-windows-amd64.zip
+            shim_artifact: libduckdb-shim-win32-x64.dll
     steps:
       - uses: actions/checkout@v4
 
@@ -79,17 +83,53 @@ jobs:
           sudo cp libduckdb/duckdb.h        "$BREW_PREFIX/include/" || true
           ls -lh "$BREW_PREFIX/lib/libduckdb.dylib"
 
-      - name: Build platform-tagged FFI shim
+      - name: Install libduckdb (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = "https://github.com/duckdb/duckdb/releases/download/$env:DUCKDB_VERSION/${{ matrix.duckdb_asset }}"
+          Write-Host "→ downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile libduckdb.zip
+          Expand-Archive -Path libduckdb.zip -DestinationPath libduckdb
+          Get-ChildItem libduckdb
+          # Stage duckdb.dll/duckdb.lib to a stable path. The driver's
+          # findDuckDBLibrary() picks up DUCKDB_LIB_PATH first, so set
+          # that for subsequent steps.
+          $dllPath = (Resolve-Path libduckdb\duckdb.dll).Path
+          $duckdbDir = (Resolve-Path libduckdb).Path
+          "DUCKDB_LIB_PATH=$dllPath" | Add-Content -Path $env:GITHUB_ENV
+          "DUCKDB_DIR=$duckdbDir"    | Add-Content -Path $env:GITHUB_ENV
+          Write-Host "  duckdb.dll: $dllPath"
+
+      - name: Setup MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build platform-tagged FFI shim (Unix)
+        if: runner.os != 'Windows'
         run: |
           make -C lib TAGGED=1
           make -C lib print-platform
           ls -lh lib/${{ matrix.shim_artifact }}
 
+      - name: Build platform-tagged FFI shim (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\lib\build.ps1 -Tagged -DuckDbDir $env:DUCKDB_DIR
+          Get-Item lib\${{ matrix.shim_artifact }}
+
       - name: Run tests
         run: bun test
 
       - name: Smoke examples
+        shell: bash
         run: |
+          set -euo pipefail
           bun examples/basic.mjs
           bun examples/prepared.mjs
           bun examples/appender.mjs

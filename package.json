@@ -1,6 +1,6 @@
 {
   "name": "duckdb-bun",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "description": "Efficient DuckDB driver for Bun, using pure FFI",
   "type": "module",
   "sideEffects": false,
@@ -23,10 +23,12 @@
     "lib/duckdb.d.ts",
     "lib/duckdb-shim.c",
     "lib/Makefile",
+    "lib/build.ps1",
     "lib/libduckdb-shim-linux-x64.so",
     "lib/libduckdb-shim-linux-arm64.so",
     "lib/libduckdb-shim-darwin-x64.dylib",
     "lib/libduckdb-shim-darwin-arm64.dylib",
+    "lib/libduckdb-shim-win32-x64.dll",
     "lib/async/index.mjs",
     "lib/async/index.d.ts",
     "lib/async/worker.mjs",
@@ -39,6 +41,7 @@
   ],
   "scripts": {
     "build:shim": "make -C lib",
+    "build:shim:win": "pwsh -File lib/build.ps1 -Tagged",
     "test": "bun test",
     "example:basic": "bun examples/basic.mjs",
     "example:prepared": "bun examples/prepared.mjs",
@@ -68,7 +71,7 @@
   },
   "homepage": "https://github.com/shreeve/duckdb-bun#readme",
   "engines": {
-    "bun": ">=1.0.0"
+    "bun": ">=1.1.0"
   },
   "publishConfig": {
     "access": "public"

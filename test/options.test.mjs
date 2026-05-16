@@ -1,6 +1,8 @@
 // OpenOptions, pragma/extension helpers, and chunks() — v0.5 features.
 
 import { test, expect, beforeEach, afterEach } from 'bun:test';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { d, open, available, DuckDBError } from './helpers.mjs';
 
 let db;
@@ -29,7 +31,7 @@ d('OpenOptions', () => {
     // DuckDB doesn't allow read-only for `:memory:` (it has no
     // pre-existing data). Create a real file, populate it, close,
     // then reopen read-only and verify writes are rejected.
-    const path = `/tmp/duckdb-bun-readonly-${Date.now()}.duckdb`;
+    const path = join(tmpdir(), `duckdb-bun-readonly-${Date.now()}.duckdb`);
     {
       using d1 = open(path);
       await d1.exec('CREATE TABLE t (n INT)');
@@ -47,7 +49,7 @@ d('OpenOptions', () => {
   });
 
   test('explicit accessMode: READ_ONLY behaves the same', async () => {
-    const path = `/tmp/duckdb-bun-accessmode-${Date.now()}.duckdb`;
+    const path = join(tmpdir(), `duckdb-bun-accessmode-${Date.now()}.duckdb`);
     {
       using d1 = open(path);
       await d1.exec('CREATE TABLE t (n INT)');
@@ -192,7 +194,7 @@ d('checkpoint helper', () => {
 
   test('CHECKPOINT actually flushes WAL on a file-backed DB', async () => {
     const { existsSync, unlinkSync, statSync } = await import('fs');
-    const path = `/tmp/duckdb-bun-checkpoint-${Date.now()}.duckdb`;
+    const path = join(tmpdir(), `duckdb-bun-checkpoint-${Date.now()}.duckdb`);
     try {
       using d2 = open(path);
       await d2.exec('CREATE TABLE t (n INT)');

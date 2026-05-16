@@ -6,6 +6,8 @@
 //     an implicit Connection)
 
 import { test, expect, beforeEach, afterEach } from 'bun:test';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import {
   d, open, available,
   DuckDBClosedError,
@@ -23,14 +25,15 @@ d('Database', () => {
     d2.close();
   });
 
-  test('open() with on-disk path works', () => {
-    const path = `/tmp/duckdb-bun-test-${Date.now()}.duckdb`;
+  test('open() with on-disk path works', async () => {
+    const path = join(tmpdir(), `duckdb-bun-test-${Date.now()}.duckdb`);
     const d2 = open(path);
     expect(d2).toBeTruthy();
-    d2.close();
-    // Cleanup the file
+    // Windows cannot delete an open DB file — must close the handle
+    // (and any implicit connection) before unlinkSync.
+    await d2.close();
     try {
-      const { unlinkSync } = require('fs');
+      const { unlinkSync } = await import('fs');
       unlinkSync(path);
       try { unlinkSync(path + '.wal'); } catch {}
     } catch {}

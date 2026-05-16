@@ -7,12 +7,14 @@ name: release
 #
 # Job topology:
 #
-#   build-shim-required  (4 shims from 3 runners)
+#   build-shim-required  (5 shims from 4 runners)
 #       linux-x64        → ubuntu-latest        → make TAGGED=1
 #       linux-arm64      → ubuntu-24.04-arm     → make TAGGED=1
 #       darwin-arm64     → macos-latest         → make TAGGED=1
 #       darwin-x64       → macos-latest         → make darwin-x64-from-arm64
 #                                                  (cross-compile via lipo + clang -arch x86_64)
+#       win32-x64        → windows-latest       → lib/build.ps1 -Tagged
+#                                                  (MSVC cl.exe via ilammy/msvc-dev-cmd)
 #                          ↓ all required
 #                       publish
 #
@@ -58,6 +60,10 @@ jobs:
             os: macos-latest
             duckdb_asset: libduckdb-osx-universal.zip
             shim_artifact: libduckdb-shim-darwin-arm64.dylib
+          - label: win32-x64
+            os: windows-latest
+            duckdb_asset: libduckdb-windows-amd64.zip
+            shim_artifact: libduckdb-shim-win32-x64.dll
     steps:
       - uses: actions/checkout@v4
 
@@ -88,8 +94,33 @@ jobs:
           sudo cp libduckdb/libduckdb.dylib "$BREW_PREFIX/lib/"
           sudo cp libduckdb/duckdb.h        "$BREW_PREFIX/include/" || true
 
-      - name: Build platform-tagged FFI shim (native)
+      - name: Install libduckdb (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = "https://github.com/duckdb/duckdb/releases/download/$env:DUCKDB_VERSION/${{ matrix.duckdb_asset }}"
+          Invoke-WebRequest -Uri $url -OutFile libduckdb.zip
+          Expand-Archive -Path libduckdb.zip -DestinationPath libduckdb
+          $duckdbDir = (Resolve-Path libduckdb).Path
+          "DUCKDB_DIR=$duckdbDir" | Add-Content -Path $env:GITHUB_ENV
+
+      - name: Setup MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build platform-tagged FFI shim (Unix)
+        if: runner.os != 'Windows'
         run: make -C lib TAGGED=1
+
+      - name: Build platform-tagged FFI shim (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\lib\build.ps1 -Tagged -DuckDbDir $env:DUCKDB_DIR
 
       - name: Cross-compile darwin-x64 shim (Apple Silicon only)
         # On the macos-latest runner, also produce the Intel-Mac shim
@@ -166,6 +197,7 @@ jobs:
           stage libduckdb-shim-linux-arm64.so
           stage libduckdb-shim-darwin-arm64.dylib
           stage libduckdb-shim-darwin-x64.dylib
+          stage libduckdb-shim-win32-x64.dll
 
           echo
           echo "=== final lib/ contents ==="
@@ -174,6 +206,7 @@ jobs:
           echo "=== shim arch verification ==="
           file lib/libduckdb-shim-darwin-arm64.dylib
           file lib/libduckdb-shim-darwin-x64.dylib
+          file lib/libduckdb-shim-win32-x64.dll
 
       - name: Verify package version matches tag
         run: |

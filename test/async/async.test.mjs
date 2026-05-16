@@ -4,6 +4,8 @@
 // lazy open, worker crash, prefetch, appender batching, close timeout.
 
 import { test, expect, describe } from 'bun:test';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 let mod;
 let available = false;
@@ -657,7 +659,7 @@ d('async OpenOptions parity', () => {
   });
 
   test('readOnly on a file-backed DB rejects writes via async', async () => {
-    const path = `/tmp/duckdb-bun-async-ro-${Date.now()}.duckdb`;
+    const path = join(tmpdir(), `duckdb-bun-async-ro-${Date.now()}.duckdb`);
     {
       await using d1 = open(path);
       await d1.exec('CREATE TABLE t (n INT)');
@@ -725,7 +727,7 @@ d('async pragma / extension / chunks', () => {
   });
 
   test('async checkpoint actually persists on a file-backed DB', async () => {
-    const path = `/tmp/duckdb-bun-async-ckpt-${Date.now()}.duckdb`;
+    const path = join(tmpdir(), `duckdb-bun-async-ckpt-${Date.now()}.duckdb`);
     try {
       {
         await using db = open(path);
