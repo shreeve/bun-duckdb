@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/duckdb-bun-social.png" alt="Logo" width="400">
+</p>
+
 # duckdb-bun
 
 [![npm version](https://img.shields.io/npm/v/duckdb-bun.svg)](https://www.npmjs.com/package/duckdb-bun)
