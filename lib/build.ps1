@@ -32,7 +32,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-Set-Location $PSScriptRoot
+
+# Use Push-Location instead of Set-Location so we don't side-effect the
+# caller's current working directory. PowerShell's `Set-Location` from
+# within a .ps1 affects the parent scope by default (no per-script cwd
+# isolation), which breaks any post-build steps that use relative paths.
+Push-Location $PSScriptRoot
+try {
 
 # Resolve to an absolute path so cl.exe doesn't get confused by relative
 # paths once we link.
@@ -122,4 +128,8 @@ if ($dumpbin) {
         throw "Missing required exports: $($missing -join ', '). Check __declspec(dllexport) in duckdb-shim.c."
     }
     Write-Host "  all required symbols present: $($required -join ', ')"
+}
+
+} finally {
+    Pop-Location
 }

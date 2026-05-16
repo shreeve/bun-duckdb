@@ -121,7 +121,6 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           .\lib\build.ps1 -Tagged -DuckDbDir $env:DUCKDB_DIR
-          Get-Item lib\${{ matrix.shim_artifact }}
 
       - name: Run tests
         run: bun test
