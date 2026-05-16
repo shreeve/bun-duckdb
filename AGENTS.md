@@ -329,6 +329,63 @@ The `readString(dataPtr, row)` helper handles both cases.
 
 ---
 
+## Async cancellation (v0.7+)
+
+`duckdb-bun/async` supports `AbortSignal` per-op cancellation. The
+sync subpath does not (sync FFI blocks the JS thread that would
+receive the abort event).
+
+### How it works
+
+1. Worker creates a `duckdb_connection` via the sync driver's
+   `db.connect()` and ships the raw handle (BigInt) and a generation
+   token back to the main thread on the `connect` / `txnBegin`
+   response.
+2. Main thread caches it in `AsyncDatabase._interruptHandles:
+   Map<connId, { ptr, generation }>`.
+3. `AsyncConnection.#runSerial` wraps every op with an abort listener
+   that — when fired during an active op — calls `duckdb_interrupt(ptr)`
+   from the main thread via the new FFI binding in `lib/duckdb.mjs`
+   (exposed through the internal `_internals` export).
+4. Bun Workers share the process's libduckdb state, so the main
+   thread calling `duckdb_interrupt` on a worker-owned connection
+   pointer is well-defined per DuckDB's C API.
+5. The worker's blocked FFI call returns with a DuckDB error. The
+   main thread sees the rejection, notices the abort flag was set,
+   and surfaces `DuckDBAbortError` (with `.name === 'AbortError'`)
+   regardless of what libduckdb actually reported.
+
+### Active-request tracking
+
+`AsyncConnection` runs ops on a per-conn serialization chain (one
+in-flight op at a time per conn — same as the sync driver's per-conn
+lock). Inside `#runSerial`, the active op gets a unique token and is
+recorded in `#activeOp`. The abort handler checks this token before
+firing `duckdb_interrupt`: if the active op is a different op (or
+the op completed and `#activeOp` is null), the abort is a no-op.
+This is what satisfies the "aborting a queued request does NOT
+interrupt the active request" invariant.
+
+### Stale-pointer safety
+
+`AsyncConnection.close()` removes the entry from `_interruptHandles`
+before sending the worker-side CLOSE. Any abort listener that fires
+after close looks up the connId and finds nothing — it bails before
+calling `duckdb_interrupt` on a freed pointer. The generation token
+provides a second line of defense but in practice the explicit
+delete is what guards us.
+
+### AsyncDatabase shortcuts
+
+`db.query / db.exec / db.iterate / db.prepare / ...` route through
+a **lazy implicit `AsyncConnection`** (`#getDefaultConn`). This
+gives cancellation a stable connection identity for db-level
+shortcuts. Before v0.7 these shortcuts used the sync driver's
+implicit conn inside the worker (no main-thread handle); the
+refactor unifies the two code paths.
+
+---
+
 ## Locking model
 
 As of v0.3, each `Connection` owns its own `AsyncMutex` instance.

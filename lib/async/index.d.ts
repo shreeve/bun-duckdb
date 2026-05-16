@@ -4,6 +4,14 @@
 // that crosses the worker boundary is async. `[Symbol.asyncDispose]`
 // is the preferred dispose pattern; `[Symbol.dispose]` is best-effort
 // fire-and-forget.
+//
+// v0.7 adds AbortSignal cancellation: every async op accepts an
+// optional `{ signal?: AbortSignal }` last argument. When the signal
+// aborts during an in-flight op, the main thread calls
+// duckdb_interrupt() on the worker-owned connection handle; the op
+// rejects with DuckDBAbortError. The sync subpath cannot deliver
+// AbortSignal (sync FFI blocks the JS thread that would receive the
+// abort event).
 
 import type {
   Row, Params, QueryResult, RunResult, AppendResult,
@@ -19,7 +27,7 @@ export type {
 // main-thread driver's, so `instanceof` cross-checks across subpaths.
 export {
   DuckDBError, DuckDBClosedError, DuckDBPrepareError,
-  DuckDBTransactionError, DUCKDB_TYPE,
+  DuckDBTransactionError, DuckDBAbortError, DUCKDB_TYPE,
 } from '../duckdb.d.ts';
 
 /** Thrown when the worker exits unexpectedly. Extends DuckDBError. */
@@ -29,8 +37,24 @@ export class DuckDBWorkerCrashedError extends Error {
 
 // OpenOptions is re-exported from '../duckdb.d.ts' above (v0.5+ shape).
 
+/** Options for any single async op that should honor an AbortSignal. */
+export interface QueryOptions {
+  /**
+   * AbortSignal used to cancel this op. (v0.7+)
+   *
+   * If aborted at call time, the op rejects immediately without
+   * sending work to the worker. If aborted while the op is the
+   * actively-running op on its connection, the main thread calls
+   * duckdb_interrupt on the worker's connection handle and the op
+   * rejects with DuckDBAbortError. Ops queued behind the active op
+   * are not interrupted; they reject (also with DuckDBAbortError)
+   * when their turn arrives.
+   */
+  signal?: AbortSignal;
+}
+
 /** Options for streaming iteration. */
-export interface IterateOptions {
+export interface IterateOptions extends QueryOptions {
   /**
    * Number of chunks the worker keeps in-flight ahead of the consumer.
    * Default 1; range [0, 4]. 0 = strict pull, max latency, min memory.
@@ -52,11 +76,11 @@ export class AsyncDatabase {
   /** Internal: worker-side numeric Database id. Null until lazy open completes. */
   readonly id: number | null;
 
-  query<T extends Row = Row>(sql: string, params?: Params): Promise<QueryResult<T>>;
-  all<T extends Row = Row>(sql: string, params?: Params):   Promise<QueryResult<T>>;
-  get<T extends Row = Row>(sql: string, params?: Params):   Promise<T | undefined>;
-  run(sql: string, params?: Params): Promise<RunResult>;
-  exec(sql: string): Promise<void>;
+  query<T extends Row = Row>(sql: string, params?: Params, opts?: QueryOptions): Promise<QueryResult<T>>;
+  all<T extends Row = Row>(sql: string, params?: Params, opts?: QueryOptions):   Promise<QueryResult<T>>;
+  get<T extends Row = Row>(sql: string, params?: Params, opts?: QueryOptions):   Promise<T | undefined>;
+  run(sql: string, params?: Params, opts?: QueryOptions): Promise<RunResult>;
+  exec(sql: string, opts?: QueryOptions): Promise<void>;
 
   prepare<T extends Row = Row>(sql: string): Promise<AsyncStatement<T>>;
 
@@ -65,7 +89,7 @@ export class AsyncDatabase {
   ): AsyncIterableIterator<T>;
 
   /** Stream rows chunk-by-chunk. (v0.5+) */
-  chunks<T extends Row = Row>(sql: string, params?: Params): AsyncIterableIterator<RowChunk<T>>;
+  chunks<T extends Row = Row>(sql: string, params?: Params, opts?: QueryOptions): AsyncIterableIterator<RowChunk<T>>;
 
   /** Run `PRAGMA name` (get) or `PRAGMA name=value` (set). (v0.5+) */
   pragma(name: string, value?: string | number | boolean | bigint | null): Promise<Row | undefined>;
@@ -100,11 +124,11 @@ export class AsyncDatabase {
 export class AsyncConnection {
   readonly id: number | null;
 
-  query<T extends Row = Row>(sql: string, params?: Params): Promise<QueryResult<T>>;
-  all<T extends Row = Row>(sql: string, params?: Params):   Promise<QueryResult<T>>;
-  get<T extends Row = Row>(sql: string, params?: Params):   Promise<T | undefined>;
-  run(sql: string, params?: Params): Promise<RunResult>;
-  exec(sql: string): Promise<void>;
+  query<T extends Row = Row>(sql: string, params?: Params, opts?: QueryOptions): Promise<QueryResult<T>>;
+  all<T extends Row = Row>(sql: string, params?: Params, opts?: QueryOptions):   Promise<QueryResult<T>>;
+  get<T extends Row = Row>(sql: string, params?: Params, opts?: QueryOptions):   Promise<T | undefined>;
+  run(sql: string, params?: Params, opts?: QueryOptions): Promise<RunResult>;
+  exec(sql: string, opts?: QueryOptions): Promise<void>;
 
   prepare<T extends Row = Row>(sql: string): Promise<AsyncStatement<T>>;
 
@@ -113,7 +137,7 @@ export class AsyncConnection {
   ): AsyncIterableIterator<T>;
 
   /** Stream rows chunk-by-chunk. (v0.5+) */
-  chunks<T extends Row = Row>(sql: string, params?: Params): AsyncIterableIterator<RowChunk<T>>;
+  chunks<T extends Row = Row>(sql: string, params?: Params, opts?: QueryOptions): AsyncIterableIterator<RowChunk<T>>;
 
   /** Run `PRAGMA name` (get) or `PRAGMA name=value` (set). (v0.5+) */
   pragma(name: string, value?: string | number | boolean | bigint | null): Promise<Row | undefined>;
@@ -152,9 +176,9 @@ export class AsyncStatement<T extends Row = Row> {
   readonly id: number;
   readonly closed: boolean;
 
-  all(params?: Params):  Promise<QueryResult<T>>;
-  get(params?: Params):  Promise<T | undefined>;
-  run(params?: Params):  Promise<RunResult>;
+  all(params?: Params, opts?: QueryOptions): Promise<QueryResult<T>>;
+  get(params?: Params, opts?: QueryOptions): Promise<T | undefined>;
+  run(params?: Params, opts?: QueryOptions): Promise<RunResult>;
 
   iterate(params?: Params, opts?: IterateOptions): AsyncIterableIterator<T>;
 

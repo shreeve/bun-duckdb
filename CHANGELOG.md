@@ -4,6 +4,88 @@ All notable changes documented here. Versioning follows
 [semver](https://semver.org/) — `0.x` releases may make breaking changes
 between minor versions until the `1.0.0` API freeze.
 
+## 0.7.0 — 2026-05-15
+
+**AbortSignal cancellation on the async subpath.** Every async op now
+accepts an optional `{ signal?: AbortSignal }` last argument. When the
+signal aborts, the main thread interrupts the worker's blocked FFI
+call via `duckdb_interrupt`; the op rejects with `DuckDBAbortError`.
+
+The v0.4.1 forward-compat plumbing shipped per-connection interrupt
+handles + generation tokens. v0.7 wires them up.
+
+### Added
+
+- **`DuckDBAbortError`** — new error class. `.name === 'AbortError'`
+  (Web standard convention used by fetch / ReadableStream / etc.),
+  `.code === 'ERR_DUCKDB_ABORTED'`, `instanceof DuckDBError`. Exported
+  from both `duckdb-bun` and `duckdb-bun/async`.
+- **`signal?: AbortSignal`** on every async op:
+  - `AsyncConnection.query / all / get / run / exec / iterate / chunks`
+  - `AsyncDatabase` shortcuts (same surface, delegated through a lazy
+    implicit `AsyncConnection`)
+  - `AsyncStatement.all / get / run / iterate`
+  - Sub-ops inside `db.transaction(async tx => { ... })` callbacks
+- **Per-connection serialization on the main thread.** Each
+  `AsyncConnection` now has an internal promise chain that serializes
+  every op against the conn's other ops. Matches the sync driver's
+  per-`Connection` lock semantics, and gives cancellation a well-
+  defined "active request" to interrupt without racing queued ones.
+
+### Changed
+
+- **`AsyncDatabase` shortcuts now route through a lazy implicit
+  `AsyncConnection`.** Previously `db.query / db.exec / db.prepare`
+  etc. used the sync driver's implicit connection inside the worker
+  (KIND.DB target). That conn's handle wasn't reachable from the
+  main thread, so cancellation couldn't target it. The refactor
+  gives every db-level shortcut a stable connection identity for
+  `AbortSignal` to interrupt. Behavior is otherwise identical.
+- **`AsyncConnection.close()` drains its serial chain before
+  transitioning to `'closing'`** so queued ops complete normally
+  rather than rug-pull-rejecting with `DuckDBClosedError`. Avoids an
+  unhandled-rejection window where queued promises rejected faster
+  than user `.then()` handlers attached. Ops added after `close()` is
+  called still reject synchronously at the entrance check.
+- **`duckdb_interrupt` FFI binding** added to `lib/duckdb.mjs` and
+  exposed via the new (internal, underscore-prefixed) `_internals`
+  export. Used by the async subpath; not part of the public API.
+
+### Cancellation semantics (the careful bits)
+
+The implementation satisfies these invariants, each covered by a
+test in `test/async/cancel.test.mjs`:
+
+1. Active long query aborts quickly (no busy-wait to the natural end)
+2. Abort error is `DuckDBAbortError`; `.name === 'AbortError'`
+3. Already-aborted signal rejects before sending work to the worker
+4. Aborting a queued request does NOT interrupt the active request
+5. Abort during an active iterator's `iterNext` cleans up
+6. Abort while iterator has buffered rows rejects on next `.next()`
+7. Sub-op abort inside a transaction rolls back
+8. Late abort (after a query already resolved) does nothing
+9. `close()` removes the interrupt handle; late abort cannot call
+   `duckdb_interrupt` on a freed connection pointer
+10. Worker crash + aborted in-flight request does not hang
+
+The sync subpath does **not** get `AbortSignal`. Sync FFI blocks the
+JS thread that would receive the abort event — the listener can't
+fire until the query returns. We considered an interrupt-from-another-
+thread approach but it would require a second Bun worker thread for
+the sync driver too, adding cost and complexity for an API that's
+already covered by the async subpath. (If you need cancellation, use
+`duckdb-bun/async`.)
+
+### Not in scope
+
+- Cancellation of `db.transaction(fn)` itself — aborting a sub-op
+  inside the callback rolls back, but there's no signal on the
+  outer `transaction()` call. The callback owns its own abort
+  policy. Easy to add later if anyone wants it.
+- Cancellation across multiple connections — each `AsyncConnection`
+  has its own per-conn signal scope. A signal passed to `conn1.query`
+  cannot abort an op on `conn2`.
+
 ## 0.6.0 — 2026-05-15
 
 **Windows x86_64 support.** First-class Windows port: pre-built shim
