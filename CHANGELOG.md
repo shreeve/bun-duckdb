@@ -4,6 +4,52 @@ All notable changes documented here. Versioning follows
 [semver](https://semver.org/) — `0.x` releases may make breaking changes
 between minor versions until the `1.0.0` API freeze.
 
+## 0.5.2 — 2026-05-15
+
+Stabilization pass. **No public API changes, no behavior changes —
+pure documentation and comment cleanup** to bring the in-tarball docs
+in sync with what was actually shipped across v0.3 → v0.5.1.
+
+### Documentation
+
+- **README rewritten** in several sections to reflect v0.5.1 reality:
+  API tables on Database / Connection / Statement now list every
+  shipped helper (`chunks`, `pragma`, `installExtension`,
+  `loadExtension`, `checkpoint`); errors table adds
+  `DuckDBWorkerCrashedError`; Roadmap section rewritten with
+  "Shipped / Planned / Likely later / Not planned" structure;
+  cancellation note updated (v0.5 → v0.6); Windows compatibility
+  clarified ("planned for v0.7; currently no shipped shim").
+- **AGENTS.md** — architecture diagram redrawn to show the sync
+  driver and async subpath side-by-side; file table updated;
+  stale references to a single test file replaced.
+- **CONTRIBUTING.md** — test count and driver line count updated;
+  examples list adds `iterate.mjs` and `async.mjs`.
+- **CHANGELOG.md** — older entries' forward-looking "v0.5 will ship
+  cancellation" updated to reflect the actual v0.6+ target.
+- **`docs/rfcs/0001-worker-async-api.md`** — marked
+  "Implemented in v0.4.0" as a design archive.
+- **`HANDOFF.md` deleted.** 1371 lines of v0.3→v0.5 implementation
+  planning; all work shipped. The valuable engineering knowledge
+  (FFI bugs, locking model, async architecture) lives in `AGENTS.md`;
+  the v0.4 design rationale lives in `docs/rfcs/0001`; nothing is
+  lost.
+
+### Internal
+
+- Comments in `lib/duckdb.mjs` and `lib/async/*` no longer mention
+  "v0.5 cancellation" (cancellation is now planned for v0.6+).
+  Section headers stripped of `(v0.2)` version tags where they no
+  longer match the section's full v0.5 scope. JSDoc "introduced in"
+  markers (`*(v0.5+)*`) are preserved.
+- `lib/duckdb.mjs` top-level docstring rewritten (was "No Zig, no
+  npm package" — confusing for a package that ships on npm).
+
+### Repo
+
+- Net change: 11 files modified, +250 / −1585 lines (mostly the
+  HANDOFF.md deletion). Suite still 232 tests; tarball still 16 files.
+
 ## 0.5.1 — 2026-05-15
 
 Tiny follow-up to v0.5.0 fills in a missing affordance.
@@ -162,8 +208,10 @@ spike confirmed the viable architecture: **the main thread calls
 `duckdb_interrupt(handle)` directly while the worker is blocked**;
 interrupt latency 2ms; DuckDB returns `"INTERRUPT Error: Interrupted!"`.
 
-v0.5.0 will ship that architecture. v0.4.1 lays the protocol
-groundwork now so v0.5's wire format is a strict superset.
+v0.6.0 will ship that architecture (originally targeted for v0.5,
+deferred when v0.5 became a core-polish release instead). v0.4.1
+lays the protocol groundwork now so the eventual v0.6 wire format
+is a strict superset.
 
 ### Added (forward-compat only)
 
@@ -171,12 +219,12 @@ groundwork now so v0.5's wire format is a strict superset.
   the worker now sends the raw `duckdb_connection` pointer (as
   `BigInt`) plus a monotonic `interruptGeneration` token on every
   `connect` and `txnBegin` response. The main proxy caches them but
-  **does not use them in v0.4.1**. v0.5 will wire them into
+  **does not use them in v0.4.1**. v0.6 will wire them into
   `mainLib.duckdb_interrupt(ptr)` on `AbortSignal.abort`. The
-  generation token lets v0.5 detect stale abort listeners that fire
-  after a connId has been reused.
+  generation token lets the future implementation detect stale abort
+  listeners that fire after a connId has been reused.
 - Handles are cleared from `_interruptHandles` on `Connection.close()`
-  and `Database.close()` so late aborts (v0.5) can't fire on freed
+  and `Database.close()` so late aborts can't fire on freed
   connections.
 
 ### Tests
@@ -197,17 +245,16 @@ groundwork now so v0.5's wire format is a strict superset.
 - **README** now has a "Cancellation note" inline with the async
   example explaining: v0.4.x has no `AbortSignal`; `close({ timeout })`
   is the only fallback and is a *shutdown hammer*, not a per-request
-  primitive; v0.5 will add `AbortSignal` to the async subpath only;
-  the sync `duckdb-bun` API will **never** get `AbortSignal` (sync
-  FFI blocks the JS thread that would receive the event).
+  primitive; a future minor release will add `AbortSignal` to the
+  async subpath only; the sync `duckdb-bun` API will **never** get
+  `AbortSignal` (sync FFI blocks the JS thread that would receive
+  the event).
 - **`docs/rfcs/0001-worker-async-api.md` §16 #5** rewritten with
   spike data, the revised architecture, the GPT-5.5-flagged
   correctness invariant (only call `duckdb_interrupt` when the
   aborted request is known to be active on its target connection —
   otherwise you cancel the wrong query), and the revised scope
   estimate (1.5–3 days, not "half a day").
-- **HANDOFF.md** updated with v0.4.0 ship, v0.4.1 ship, the spike
-  findings, and the revised v0.5/v0.6 roadmap.
 
 ## 0.4.0 — 2026-05-15
 
@@ -283,9 +330,9 @@ end-to-end before any implementation landed; design contract at
 ### Acknowledged limitations
 
 - **No cancellation in v0.4.** `AbortSignal` / `duckdb_interrupt()`
-  is the headline v0.5 feature (see [RFC §16 #5](./docs/rfcs/0001-worker-async-api.md#16--open-questions--resolved-decisions)
-  for rationale). Users wanting bounded shutdown should use
-  `db.close({ timeout })`.
+  is a planned future feature (see [RFC §16 #5](./docs/rfcs/0001-worker-async-api.md#16--open-questions--resolved-decisions)
+  for the proven architecture). Users wanting bounded shutdown should
+  use `db.close({ timeout })`.
 - **One Worker per Database.** No Worker pooling. Heavy multi-tenant
   workloads should evaluate cost; revisit if needed in v0.4.x.
 - **No `Transferable` optimization** for result transport.
@@ -309,10 +356,13 @@ end-to-end before any implementation landed; design contract at
   for `BLOB` / `Date` / `BIGINT`.
 - Total test count: 134 main + 44 async = **178**.
 
-### Roadmap shift
+### Roadmap note
 
-The v0.4 RFC pushed `AbortSignal` support to v0.5 and Windows to v0.6.
-README's Roadmap section reflects this.
+The v0.4 RFC originally targeted `AbortSignal` for v0.5 and Windows
+for v0.6. The actual sequence ended up different: v0.5 became core-
+polish features (OpenOptions, pragma helpers, chunks, TxnHandle);
+cancellation slid to v0.6+ and Windows to v0.7+. See README's Roadmap
+section for the current plan.
 
 ## 0.3.0 — 2026-05-15
 
@@ -373,7 +423,7 @@ sibling connections.
   queries queued behind the iterator wake up inside their own
   withLock callback, see `state === 'closing'`, and abort with
   `DuckDBClosedError` before any FFI call. This eliminates a race
-  HANDOFF.md's earlier sketch left under-specified.
+  the original design sketch left under-specified.
 
 ### Migration from v0.2.x to v0.3
 

@@ -1,15 +1,12 @@
-// TypeScript declarations for duckdb-bun v0.5
+// TypeScript declarations for duckdb-bun.
 //
-// Hand-written. Mirrors lib/duckdb.mjs's runtime API. Generic parameters
-// let users tighten row shapes when they know them; defaults are loose
-// (Record<string, unknown>) for ad-hoc queries.
+// Hand-written. Mirrors lib/duckdb.mjs's runtime API exactly. Generic
+// parameters let users tighten row shapes when they know them; defaults
+// are loose (`Record<string, unknown>`) for ad-hoc queries.
 //
-// v0.3: Statement.iterate(), Connection.iterate(), Database.iterate(),
-//       [Symbol.asyncDispose], async close()
-// v0.4: duckdb-bun/async subpath, AbortSignal forward-compat plumbing
-// v0.5: OpenOptions, pragma/installExtension/loadExtension helpers,
-//       chunks() chunk-by-chunk streaming, TxnHandle (scoped transaction
-//       handle that throws on use-after-callback)
+// Per-feature "introduced in" markers in JSDoc comments (e.g. *(v0.5+)*)
+// trace each method back to its release. See CHANGELOG.md for full
+// release notes.
 
 // ============================================================================
 // Type system

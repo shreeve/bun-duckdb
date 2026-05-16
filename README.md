@@ -82,16 +82,15 @@ clearInterval(t);
 
 See [`examples/async.mjs`](./examples/async.mjs) for the full surface.
 
-> **Cancellation note (v0.4.x):** `AbortSignal` per-query cancellation
-> is planned for v0.5.0 on the async subpath only — a post-v0.4 spike
-> proved the architecture (`main thread calls duckdb_interrupt` on the
-> worker's connection handle while the worker is blocked in FFI;
-> interrupt latency ~2ms). Until v0.5, the safety valve for hung
-> queries is `db.close({ timeout: ms })`, which terminates the whole
-> Worker — not a per-request primitive. The synchronous `duckdb-bun`
-> API won't get `AbortSignal` even after v0.5 (sync FFI blocks the JS
-> thread that would receive the event); use `duckdb-bun/async` if you
-> need cancellation.
+> **Cancellation note (v0.5.x):** `AbortSignal` per-query cancellation
+> is planned for v0.6.0 on the async subpath only. The architecture is
+> proven (main thread calls `duckdb_interrupt` on the worker's
+> connection handle while the worker is blocked in FFI; interrupt
+> latency ~2ms). Until v0.6, the safety valve for hung queries is
+> `db.close({ timeout: ms })`, which terminates the whole Worker —
+> not a per-request primitive. The synchronous `duckdb-bun` API will
+> **not** get `AbortSignal` (sync FFI blocks the JS thread that would
+> receive the event); use `duckdb-bun/async` if you need cancellation.
 
 ## Why
 
@@ -258,8 +257,9 @@ For bulk insert see [`examples/appender.mjs`](./examples/appender.mjs).
 > **Note: `conn.query()` returns a Promise.** The driver serializes
 > FFI calls through an internal async lock to keep concurrent calls
 > on a single Connection safe. The return value is awaitable.
-> A future version may also expose a sync API to match
-> `better-sqlite3` / `bun:sqlite` conventions — see Roadmap.
+> Note: FFI calls themselves are synchronous — long-running queries
+> still block the Bun event loop. Use `duckdb-bun/async` (Worker-
+> backed; same API) when event-loop responsiveness matters.
 
 ## TypeScript
 
@@ -296,7 +296,7 @@ calls work without ceremony — tighten only when you know the shape.
 
 ## API reference
 
-### `open(path) → Database`
+### `open(path, opts?) → Database`
 
 Opens (or creates) a DuckDB database at `path`. Pass `':memory:'` for
 an in-memory database.
@@ -304,9 +304,24 @@ an in-memory database.
 ```js
 const db = open(':memory:');
 const db = open('analytics.duckdb');
+const db = open('analytics.duckdb', { readOnly: true });
+const db = open(':memory:', { threads: 4, memoryLimit: '2GB' });
 ```
 
-Throws if DuckDB rejects the path.
+`opts` (v0.5+) is an optional `OpenOptions` bag:
+
+| Field | Type | Notes |
+|---|---|---|
+| `readOnly` | `boolean` | Sugar for `accessMode: 'READ_ONLY'` |
+| `accessMode` | `'AUTOMATIC' \| 'READ_ONLY' \| 'READ_WRITE'` | Maps to DuckDB's `access_mode` |
+| `threads` | `number` | Positive integer |
+| `memoryLimit` | `string` | e.g. `'1GB'`, `'512MB'`, `'80%'` |
+| `tempDirectory` | `string` | DuckDB's `temp_directory` |
+| `config` | `Record<string, string\|number\|boolean\|bigint>` | Escape hatch for any DuckDB config key not exposed above |
+
+Typed options and `config` setting the same DuckDB key with different
+values throw `DuckDBError`; matching values are allowed. Throws if
+DuckDB rejects the path or the config.
 
 ### `version() → string`
 
@@ -327,8 +342,13 @@ the shortcut methods (`query`, `all`, `get`, `run`, `exec`, `prepare`,
 | `db.run(sql, params?)` | `Promise<{ rowsChanged }>` | Execute for side effects (DML/DDL). |
 | `db.exec(sql)` | `Promise<void>` | Fire-and-forget multi-statement; no params, no rows. |
 | `db.prepare(sql)` | `Promise<Statement<T>>` | Returns a reusable `Statement`. Caller closes it. |
-| `db.iterate(sql, params?)` | `AsyncIterableIterator<T>` | Stream rows row-by-row. Sugar that prepares a temp Statement lazily on first `.next()`; the temp Statement is closed in `finally`. *(v0.3+)* |
-| `db.transaction(fn)` | `Promise<R>` | BEGIN before, COMMIT after success, ROLLBACK + rethrow on throw. |
+| `db.iterate(sql, params?)` | `AsyncIterableIterator<T>` | Stream rows row-by-row. Sugar that lazy-prepares a temp Statement on first `.next()`; closed in `finally`. *(v0.3+)* |
+| `db.chunks(sql, params?)` | `AsyncIterableIterator<RowChunk<T>>` | Stream chunk-by-chunk; each yield is `{ rows, chunkIndex, rowOffset }` (DuckDB vector ≈ 2048 rows). *(v0.5+)* |
+| `db.transaction(fn)` | `Promise<R>` | BEGIN before, COMMIT after success, ROLLBACK + rethrow on throw. `fn` receives a scoped `TxnHandle` that throws on use after the callback returns (v0.5+). |
+| `db.pragma(name, value?)` | `Promise<Row \| undefined>` | `PRAGMA name` (get) or `PRAGMA name=value` (set). Strict identifier validation. *(v0.5+)* |
+| `db.installExtension(name)` | `Promise<void>` | `INSTALL <name>` with identifier validation. *(v0.5+)* |
+| `db.loadExtension(name)` | `Promise<void>` | `LOAD <name>` with identifier validation. *(v0.5+)* |
+| `db.checkpoint(opts?)` | `Promise<void>` | `CHECKPOINT` / `FORCE CHECKPOINT` / `CHECKPOINT <db>`. Flushes WAL on file-backed DBs. *(v0.5.1+)* |
 | `db.connect()` | `Connection` | A fresh, independent Connection. |
 | `db.close()` | `Promise<void>` | Closes the database and the implicit Connection. Idempotent. Async as of v0.3 (the public handle still nulls out synchronously so `db.close(); db.handle === null` continues to hold). |
 | `db[Symbol.dispose]()` | `void` | Fires `close().catch(...)` — fire-and-forget. Enables `using db = open(...)`. |
@@ -342,9 +362,14 @@ on one Database run independently — use them for parallelism.
 
 | Method | Returns | Description |
 |---|---|---|
-| `conn.query(sql, params?)` | `Promise<QueryResult<T>>` | Execute. Internally one-shot for no params; prepared+execute+destroy if params given. |
+| `conn.query(sql, params?)` | `Promise<QueryResult<T>>` | Execute. One-shot for no params; prepare+execute+destroy if params given. |
 | `conn.all/get/run/exec/prepare/transaction` | (same as `Database`) | Shortcuts mirror `Database`. |
 | `conn.iterate(sql, params?)` | `AsyncIterableIterator<T>` | Stream rows. Sugar over `prepare(sql).iterate(params)`; lazy temp Statement. *(v0.3+)* |
+| `conn.chunks(sql, params?)` | `AsyncIterableIterator<RowChunk<T>>` | Stream chunk-by-chunk. *(v0.5+)* |
+| `conn.pragma(name, value?)` | `Promise<Row \| undefined>` | `PRAGMA` get/set. *(v0.5+)* |
+| `conn.installExtension(name)` | `Promise<void>` | `INSTALL <name>`. *(v0.5+)* |
+| `conn.loadExtension(name)` | `Promise<void>` | `LOAD <name>`. *(v0.5+)* |
+| `conn.checkpoint(opts?)` | `Promise<void>` | `CHECKPOINT` / `FORCE CHECKPOINT` / named. *(v0.5.1+)* |
 | `conn.append(table, columns, rows)` | `Promise<{ rows: number }>` | Bulk insert via DuckDB's Appender API. Fastest path for loading many rows. See [`examples/appender.mjs`](./examples/appender.mjs). |
 | `conn.executeBatchPrepared(sql, batches)` | `Promise<{ rows: number }>` | Advanced: execute one prepared statement multiple times with batched parameter sets. |
 | `conn.countStatements(sql)` | `number` (sync) | Parses `sql`; returns the number of statements without executing. Throws on parse failure. |
@@ -372,6 +397,7 @@ for (const [id, name] of rows) await stmt.run([id, name]);
 | `stmt.get(params?)` | `Promise<T \| undefined>` | First row, or undefined. |
 | `stmt.run(params?)` | `Promise<{ rowsChanged }>` | Execute for side effects. |
 | `stmt.iterate(params?)` | `AsyncIterableIterator<T>` | Bind + execute, then stream rows one at a time. Holds the owning Connection's lock for the iterator's lifetime — concurrent ops on that Connection queue. Use multiple `db.connect()` for parallel streams. *(v0.3+)* |
+| `stmt.chunks(params?)` | `AsyncIterableIterator<RowChunk<T>>` | Same lock/lifecycle as `iterate`, but yields per-DuckDB-vector chunks of rows. Useful for batch processing. *(v0.5+)* |
 | `stmt.close()` | `Promise<void>` | Free the prepared handle. Idempotent. Async as of v0.3 (cancels any active iterator before destroy; `.closed` still flips synchronously). |
 | `stmt[Symbol.dispose]()` | `void` | Fires `close().catch(...)` — fire-and-forget. |
 | `stmt[Symbol.asyncDispose]()` | `Promise<void>` | Awaits `close()`. *(v0.3+)* |
@@ -388,9 +414,10 @@ common failure modes:
 | Class | When it's thrown |
 |---|---|
 | `DuckDBError` | Generic driver error (DuckDB returned an error message) |
-| `DuckDBClosedError` | Use of a closed Database/Connection/Statement |
+| `DuckDBClosedError` | Use of a closed Database / Connection / Statement |
 | `DuckDBPrepareError` | `prepare()` failed (typically a SQL syntax error) |
-| `DuckDBTransactionError` | Nested transactions (planned for v0.3 via SAVEPOINT) |
+| `DuckDBTransactionError` | Nested transactions (DuckDB does not yet support `SAVEPOINT`) or using a `TxnHandle` after its callback returned |
+| `DuckDBWorkerCrashedError` | (`duckdb-bun/async` only) Worker exited unexpectedly. All pending request promises reject with this; future calls on any proxy from that Database reject with `DuckDBClosedError`. |
 
 ```js
 import { DuckDBError, DuckDBClosedError } from 'duckdb-bun';
@@ -516,8 +543,9 @@ SQL casts: `'SELECT CAST(? AS UINTEGER)'`.
   FFI work completes. The Promise interface is the serialization
   mechanism, not a true off-thread runner — long-running analytical
   queries still block the Bun event loop while they execute. For a
-  truly off-thread interface, use a Web Worker today, or wait for
-  the forthcoming `duckdb-bun/async` subpath. See Roadmap.
+  truly off-thread interface, use `duckdb-bun/async` (Worker-backed;
+  same API surface, ~25% latency tax on small queries, but the main
+  event loop stays responsive).
 
 ## Examples
 
@@ -529,90 +557,61 @@ SQL casts: `'SELECT CAST(? AS UINTEGER)'`.
 
 ## Roadmap
 
-### v0.2.0 — shipped (current release)
+For a full release-by-release history (including breaking changes,
+benchmarks, and design notes), see [CHANGELOG.md](./CHANGELOG.md).
 
-- [x] `db.query/all/get/run/exec` shortcuts on `Database` (lazy
-      implicit `Connection`)
-- [x] `db.prepare(sql)` and `conn.prepare(sql)` returning a reusable
-      `Statement` with `.all/get/run/close`
-- [x] `db.transaction(fn)` helper — BEGIN, COMMIT, ROLLBACK on throw
-- [x] `Symbol.dispose` on `Database`, `Connection`, `Statement` for
-      `using db = open(...)` / `using stmt = await db.prepare(...)`
-- [x] TypeScript declarations (`lib/duckdb.d.ts`) shipped, generic
-      row types via `db.query<T>(sql)`
-- [x] Named error classes: `DuckDBError`, `DuckDBClosedError`,
-      `DuckDBPrepareError`, `DuckDBTransactionError`
+### Shipped
 
-### v0.2.1 — shipped
+- **v0.2** — `Database` / `Connection` / `Statement` classes; shortcut
+  methods (`query`/`all`/`get`/`run`/`exec`/`prepare`/`transaction`);
+  `Symbol.dispose`; TypeScript declarations; named error classes;
+  pre-built shim binaries for Linux x64 / Linux arm64 / macOS x64 /
+  macOS arm64.
+- **v0.3** — `Statement.iterate(params?)` for streaming large result
+  sets; `Connection.iterate(sql, params?)` and `Database.iterate(sql,
+  params?)` sugar (lazy-prepare); **per-Connection locks** (replaces
+  the older process-global lock); `[Symbol.asyncDispose]`; async
+  `close()` (soft-breaking — public handles still null synchronously).
+- **v0.4** — `duckdb-bun/async` Worker-backed subpath. Identical API,
+  every DuckDB call runs in a Worker so the main event loop stays
+  responsive. Pull-based per-chunk streaming with configurable
+  `prefetch`. Streaming `AsyncAppender` with proxy-side batching.
+- **v0.5** — Core-polish release. `open(path, opts?)` with `OpenOptions`
+  (`readOnly` / `accessMode` / `threads` / `memoryLimit` / `config` escape
+  hatch). `pragma` / `installExtension` / `loadExtension` helpers
+  with strict identifier validation. `chunks()` chunk-by-chunk
+  streaming on Statement / Connection / Database. `TxnHandle` —
+  scoped transaction handle that throws on use after callback.
+- **v0.5.1** — `checkpoint(opts?)` helper (CHECKPOINT /
+  `FORCE CHECKPOINT` / named).
 
-- [x] **Pre-built shim binaries** for Linux x64 / Linux arm64 /
-      macOS x64 / macOS arm64 bundled into the npm tarball.
-      `bun add duckdb-bun` is now zero-friction install — no `make`
-      step required.
-- [x] CI runs the full test suite + smokes the examples on all four
-      platforms on every push.
+### Planned
 
-### v0.3.0 — shipped
+- **v0.6** — `AbortSignal` per-query cancellation on the async subpath
+  (architecture proven: main thread calls `duckdb_interrupt` on the
+  worker's connection handle while the worker is blocked in FFI).
+  The sync subpath will not get `AbortSignal` — sync FFI blocks the
+  JS thread that would receive the abort event.
+- **v0.7** — Windows x86_64. Pre-built shim binary (MSVC build), CI
+  matrix entry, `findDuckDBLibrary` Windows paths.
+- **v1.0** — API freeze. Optional companion packages
+  (`duckdb-bun-kysely`, `duckdb-bun-drizzle`).
 
-- [x] **`Statement.iterate(params?)`** returning `AsyncIterableIterator<T>`
-      for streaming large result sets without materialization, plus
-      `Connection.iterate(sql, params?)` and `Database.iterate(sql,
-      params?)` sugar (lazy-prepare).
-- [x] **Per-Connection locks** (previously process-global), so a
-      streaming iterator on one Connection no longer blocks queries
-      on sibling Connections.
-- [x] **`[Symbol.asyncDispose]`** on `Database`, `Connection`,
-      `Statement` for `await using db = open(...)`. Soft-breaking
-      change: `close()` is now async (handle still nulls out
-      synchronously; FFI destroy in the returned Promise).
+### Likely later
 
-### v0.4.0 — shipped
-
-- [x] **`duckdb-bun/async`** Worker-backed subpath — same API as the
-      main package, but every DuckDB call runs inside a Worker so the
-      main event loop stays responsive during long queries.
-      Benchmark: ~90% of expected timer ticks fire during a 450ms
-      async query (vs 0% sync). Small-query overhead is ~25%.
-- [x] Pull-based per-chunk streaming over `postMessage` with
-      configurable `prefetch: 1` (range `[0, 4]`).
-- [x] Streaming `AsyncAppender` with proxy-side batching
-      (default `batchSize: 1000`), sticky poisoned-state on batch
-      error.
-
-### v0.3.x / v0.4.x — still planned
-
-- [ ] `conn.chunks(sql, params?)` exposing raw chunk iteration for
-      maximum efficiency on multi-million-row results
-- [ ] Nested transactions via `SAVEPOINT` (currently throws
-      `DuckDBTransactionError`)
-- [ ] `db.installExtension(name)` / `db.loadExtension(name)` thin
-      helpers (equivalent to SQL but discoverable from the docs)
-- [ ] Configurable type conversion — opt-in `DECIMAL → string` mode
-      to preserve precision past 15 digits
-
-### v0.5.0 — `AbortSignal` cancellation
-
-- [ ] `AbortSignal` support backed by `duckdb_interrupt()` across both
-      `duckdb-bun` and `duckdb-bun/async`. Deferred from v0.4 for
-      scope reasons; will be the headline v0.5 feature.
-
-### v0.6.0 — Windows x86_64
-
-- [ ] Pre-built shim binary for `win32-x64` + MSVC build target.
-      Was originally v0.5; pushed back to v0.6 when cancellation
-      took the v0.5 slot.
-
-### v1.0.0 — stable API
-
-- API freeze
-- Comprehensive docs site
-- Optional companion packages: `duckdb-bun-kysely` (dialect),
-  `duckdb-bun-drizzle` (adapter)
+- Configurable type conversion — opt-in `BIGINT → bigint` mode for
+  users hitting values >2^53 (snowflake IDs, nanosecond timestamps,
+  hashes). Currently `BIGINT → number` (documented sharp edge); users
+  can `CAST(? AS HUGEINT)` or `CAST(? AS VARCHAR)` for full precision
+  today.
+- Nested transactions via `SAVEPOINT`. Blocked on upstream DuckDB:
+  v1.5.2's parser does not yet accept `SAVEPOINT`. `tx.transaction()`
+  is reserved on the API surface so it becomes a non-breaking add
+  when upstream lands it.
 
 ### Explicitly not planned
 
-- Query builder
-- Models / repositories / Active Record
+- Query builder, ORMs, models / repositories / Active Record
 - Migrations
 - Schema introspection beyond what DuckDB's `PRAGMA show_tables` /
   `DESCRIBE` already gives you
@@ -645,9 +644,10 @@ import fails and the test suite no-ops with `describe.skip`).
 - **Bun:** ≥ 1.0
 - **DuckDB:** any modern release with the chunk API (≥ v0.10
   recommended; tested against v1.5.x)
-- **Platforms:** macOS arm64, macOS x64, Linux x64 (with shim),
-  Linux arm64, Windows x64 (libduckdb required on PATH or via
-  `DUCKDB_LIB_PATH`)
+- **Platforms (shipped shims):** macOS arm64, macOS x64, Linux x64,
+  Linux arm64
+- **Windows:** planned for v0.7 (currently no shipped shim binary;
+  the package will fail to load on Windows today)
 
 ## Related
 

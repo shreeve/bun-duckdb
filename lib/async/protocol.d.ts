@@ -105,7 +105,7 @@ export interface OpenResult   { dbId: number }
  * Reply to a `connect` / `txnBegin` request.
  *
  * `interruptHandle` is the raw `duckdb_connection` pointer (cast to
- * `BigInt`). It's reserved for v0.5 cancellation: the main thread will
+ * `BigInt`). Reserved for the planned AbortSignal cancellation: the main thread will
  * dlopen `duckdb_interrupt` and call it with this handle to abort an
  * in-flight query while the worker is blocked in FFI. The handle is
  * never dereferenced from JavaScript on the main thread.

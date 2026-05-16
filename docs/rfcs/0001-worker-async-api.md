@@ -2,28 +2,37 @@
 
 | Field | Value |
 |---|---|
-| Status | **Draft v2** — fresh-review pass completed; awaiting user approval |
+| Status | **Implemented in v0.4.0** (shipped 2026-05-15). Preserved here as a design archive. |
 | Target release | v0.4.0 |
 | Drafted | 2026-05-15 |
 | Reviewed | 2026-05-15 (Anthropic Opus 4.7 via `mcp/user-ai/discuss`; load-balanced from a GPT-5.5 conversation) |
-| Implements | HANDOFF.md §7 |
 | Prerequisites | v0.3.0 shipped (`Statement.iterate()` semantics frozen) |
+
+### Why this RFC still exists
+
+The `duckdb-bun/async` subpath has shipped — most of the
+implementation TODOs below are historical. The document is preserved
+as a design archive: future maintainers reading
+`lib/async/{index,worker,protocol}.mjs` can trace back to the
+decisions and trade-offs that produced the current shape.
+
+The one section that is still actively useful is **§16 #5
+(cancellation)** — the spike findings and architecture there describe
+the path for the planned v0.6 `AbortSignal` work. The rest of the
+document is for context.
 
 ### Changelog of this RFC
 
-- **v1 (initial draft):** consolidated HANDOFF.md §7 verbatim with light edits.
+- **v1 (initial draft):** consolidated the original async-subpath
+  plan with light edits.
 - **v2 (post-review):** added `release` op for GC notification (§6),
   ready handshake before request queue drains (§11), prefetch
   semantics for streaming with fresh-array-per-response guarantee
-  (§8), cancellation deferred-to-v0.5 with rationale (§16),
+  (§8), cancellation deferred-to-future-minor with rationale (§16),
   shared error-class registry (§6), `close({ timeout })` (§11),
   lifecycle cascade rules in worker registry (new §4.2),
   multiple-Databases-multiple-Workers doc, transaction-callback
   runs-on-main-thread doc.
-
-> Per HANDOFF.md §7, this RFC must be committed and approved before any
-> implementation code lands. Iterating on docs is cheap; iterating on a
-> shipped public API isn't.
 
 ---
 
@@ -930,7 +939,7 @@ spiked or decided before approval.
 Things to **explicitly defer to v0.5+**:
 
 - `AbortSignal` / cancellation (now the headline feature of v0.5.0 —
-  see §16 item 5). Was previously v0.5+ in HANDOFF.md; the reviewer
+  see §16 item 5). Was previously slated for v0.5+; the reviewer
   argued for v0.4 but the scope blew the budget.
 - Worker pooling (one Worker per Database stays)
 - Transferable optimization for result transport (benchmark first;
@@ -944,14 +953,14 @@ later.
 
 ### Adjusted roadmap (post-RFC)
 
-The HANDOFF.md roadmap had v0.5.0 = Windows. With cancellation now
+The original roadmap had v0.5.0 = Windows. With cancellation now
 deferred from v0.4, the new sequence is:
 
 | Version | Feature |
 |---|---|
 | v0.4.0 | `duckdb-bun/async` worker subpath (this RFC) |
 | v0.5.0 | `AbortSignal` / `duckdb_interrupt` cancellation, across both subpaths |
-| v0.6.0 | Windows x86_64 support (was v0.5.0 in HANDOFF.md) |
+| v0.6.0 | Windows x86_64 support (was v0.5.0 in the original roadmap) |
 
 User can override this ordering; the dependency chain is:
 v0.4 → v0.5 (cancellation depends on the async transport's request-id
@@ -962,7 +971,7 @@ and could ship out-of-order if it's higher priority.
 
 ## §18 · Estimated scope
 
-Per HANDOFF.md §7: **1–2 days** of focused work, including this RFC,
+Original estimate: **1–2 days** of focused work, including this RFC,
 implementation, tests (parameterized against the v0.3 suite),
 benchmarks, smoke test, README, and CHANGELOG.
 
@@ -999,7 +1008,7 @@ then, **do not write any code under `lib/async/`.**
 
 ### What the implementation PR should contain
 
-Per HANDOFF.md §3 ship-checklist plus the items here:
+Ship-checklist (matches the implementation that landed in v0.4.0):
 
 - [ ] `lib/async/index.mjs` (main-thread proxies)
 - [ ] `lib/async/worker.mjs` (Worker entry, registry, dispatcher)

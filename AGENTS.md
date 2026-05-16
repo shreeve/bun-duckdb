@@ -7,44 +7,53 @@ workarounds, and conventions for extending the driver.
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────┐
-│ duckdb-bun consumer code (Bun process)               │
-│                                                      │
-│   import { open } from 'duckdb-bun';                 │
-│   const db = open(':memory:');                       │
-│   const conn = db.connect();                         │
-│   conn.query('SELECT 42');                           │
-└────────────────────┬─────────────────────────────────┘
-                     │ JS calls
-                     ▼
-┌──────────────────────────────────────────────────────┐
-│ lib/duckdb.mjs   (the entire driver, single file)    │
-│                                                      │
-│   • Locates libduckdb (and libduckdb-shim if Linux)  │
-│   • dlopen + symbol declarations via bun:ffi         │
-│   • Database / Connection classes                    │
-│   • Chunk-based result decoding via Bun.ffi.read     │
-│   • Type-aware value conversion                      │
-│   • Appender + prepared statement plumbing           │
-└────────────────────┬──────────────────┬──────────────┘
-                     │ FFI               │ FFI
-                     ▼                   ▼
-            libduckdb            libduckdb-shim
-            (the database)       (Linux x64 only —
-                                  3 functions that
-                                  pass structs by value)
+┌──────────────────────────────────────────────────────────────┐
+│  Consumer code (Bun process)                                 │
+│                                                              │
+│  Sync path:                       Async path (v0.4+):        │
+│    import { open } from              import { open } from    │
+│      'duckdb-bun';                     'duckdb-bun/async';   │
+└──────────┬──────────────────────────────────┬────────────────┘
+           │ JS calls                         │ postMessage IPC
+           ▼                                  ▼
+┌──────────────────────────────┐  ┌────────────────────────────┐
+│ lib/duckdb.mjs               │  │ lib/async/index.mjs        │
+│ (main-thread driver, 1 file) │  │ (main-thread proxies only) │
+│                              │  │                            │
+│  • dlopen libduckdb via      │  │  • One Worker per Database │
+│    bun:ffi                   │  │  • Numeric IDs only;       │
+│  • Database / Connection /   │  │    no FFI handles cross    │
+│    Statement / Appender      │  │    postMessage             │
+│  • Chunk-based decoding      │  │  • Lazy open, ready        │
+│  • Per-Connection AsyncMutex │  │    handshake, request map  │
+└────────┬──────────────┬──────┘  └────────────┬───────────────┘
+         │ FFI          │ FFI                  │ Worker
+         ▼              ▼                      ▼
+   libduckdb     libduckdb-shim       lib/async/worker.mjs
+   (the DB)     (3 by-value funcs;        (imports lib/duckdb.mjs
+                Linux x64 ABI fix)         and dispatches by op)
 ```
 
-The whole driver is one file (`lib/duckdb.mjs`, ~1500 lines) plus a
-~30-line C shim. No build step for users (the shim is pre-shipped or
-built once with `make`).
+The main-thread driver is one file (`lib/duckdb.mjs`, ~2500 lines)
+plus a ~30-line C shim. The async subpath adds ~1100 lines across
+`lib/async/{index,worker,protocol}.{mjs,d.ts}` — no second FFI
+implementation; the worker reuses the main-thread driver wholesale.
+
+No build step for users — pre-built platform-tagged shims ship in the
+npm tarball. Source-clone contributors run `make -C lib` once.
 
 | File | Role |
 |---|---|
-| `lib/duckdb.mjs` | The entire FFI driver — symbol declarations, type decoders, classes |
+| `lib/duckdb.mjs` | The entire main-thread FFI driver — symbol declarations, type decoders, classes |
+| `lib/async/index.mjs` | Main-thread proxies for the `duckdb-bun/async` subpath |
+| `lib/async/worker.mjs` | Worker dispatcher; imports `lib/duckdb.mjs` for actual FFI |
+| `lib/async/protocol.{mjs,d.ts}` | Wire protocol constants + types + shared error registry |
 | `lib/duckdb-shim.c` | C shim wrapping 3 DuckDB functions that take `duckdb_result` by value (Linux x64 ABI workaround) |
-| `lib/Makefile` | Builds `libduckdb-shim.{so,dylib}` |
-| `test/duckdb.test.mjs` | Bun-test driver — skipped if libduckdb is absent |
+| `lib/Makefile` | Builds `libduckdb-shim.{so,dylib}` (platform-tagged with `TAGGED=1` for CI) |
+| `test/*.test.mjs` | Bun-test files, split by topic; auto-skip when `libduckdb` is absent |
+| `test/async/async.test.mjs` | End-to-end tests for the async subpath |
+| `bench/async-vs-sync.mjs` | Benchmark harness comparing sync vs Worker paths |
+| `docs/rfcs/` | Architectural RFCs (the v0.4 async design was written here first) |
 
 ---
 
@@ -185,7 +194,8 @@ works on Linux x64.
    classes. Always go through `withLock(() => ...)` for connection-
    level operations to serialize concurrent FFI calls into a single
    handle.
-5. **Add a test** in `test/duckdb.test.mjs`.
+5. **Add a test** in the appropriate `test/*.test.mjs` file (by
+   topic — `lifecycle`, `queries`, `statements`, etc.).
 
 ---
 
@@ -331,7 +341,7 @@ Symbol semantics for `using`:
 
 ```bash
 bun test                              # all tests
-bun test test/duckdb.test.mjs         # specific file
+bun test test/queries.test.mjs        # specific file
 bun examples/basic.mjs                # smoke test against installed libduckdb
 ```
 
@@ -378,9 +388,11 @@ unbounded amounts of DuckDB memory.
 
 ## Conventions
 
-- **One file.** The whole driver lives in `lib/duckdb.mjs`. Split
-  only if it crosses ~2000 lines or develops genuinely independent
-  concerns.
+- **One file for the main-thread driver.** `lib/duckdb.mjs` is at
+  ~2500 lines. Splitting is reasonable when the next risky change
+  would touch many concerns at once (e.g. a decoder rework); resist
+  splitting purely for line count. The async subpath lives in
+  `lib/async/` because Worker IPC is genuinely a different concern.
 - **No build step for the JS.** Pure ESM. The C shim is the only
   artifact that needs `make`.
 - **Honest comments.** When you add a workaround for a Bun bug or a

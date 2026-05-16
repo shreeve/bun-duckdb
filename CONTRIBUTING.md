@@ -18,12 +18,14 @@ brew install duckdb              # macOS
 make -C lib
 
 # Run the test suite
-bun test                          # 101 tests, ~300ms
+bun test                          # ~230 tests, ~2.5s
 
 # Smoke the examples
 bun examples/basic.mjs
 bun examples/prepared.mjs
 bun examples/appender.mjs
+bun examples/iterate.mjs
+bun examples/async.mjs
 ```
 
 If `libduckdb` isn't installed, `bun test` skips cleanly via
@@ -33,20 +35,25 @@ If `libduckdb` isn't installed, `bun test` skips cleanly via
 
 | What | Where |
 |---|---|
-| The whole driver | `lib/duckdb.mjs` (~1500 lines, single file) |
+| Main-thread driver | `lib/duckdb.mjs` (~2500 lines, single file) |
+| Async-subpath proxy | `lib/async/{index,worker,protocol}.{mjs,d.ts}` |
 | FFI shim source | `lib/duckdb-shim.c` (works around a Bun struct-by-value ABI bug) |
-| TypeScript declarations | `lib/duckdb.d.ts` (hand-written) |
-| Tests, by topic | `test/lifecycle.test.mjs`, `queries.test.mjs`, `statements.test.mjs`, `transactions.test.mjs`, `types.test.mjs`, `appender.test.mjs`, `errors.test.mjs` |
+| TypeScript declarations | `lib/duckdb.d.ts`, `lib/async/*.d.ts` (hand-written) |
+| Tests, by topic | `test/{lifecycle,queries,statements,transactions,types,appender,errors,iterate,options}.test.mjs` |
+| Async tests | `test/async/async.test.mjs` |
 | Shared test setup | `test/helpers.mjs` |
 | Examples | `examples/*.mjs` |
-| Architecture notes | `AGENTS.md` (covers the FFI bug knowledge — read this before adding C bindings) |
+| Architecture notes | `AGENTS.md` (FFI bug knowledge, locking model, type contract — read this before any FFI work) |
+| Design RFCs | `docs/rfcs/` (the v0.4 async subpath was designed in `0001-worker-async-api.md` first) |
 
 ## Conventions
 
 - **Pure ESM, no build step for the JS.** `lib/duckdb.mjs` is shipped
   as-is. The TypeScript declarations are hand-maintained.
-- **One file for the driver.** Don't split `lib/duckdb.mjs` unless it
-  crosses ~2000 lines and develops genuinely independent concerns.
+- **One file for the main-thread driver.** `lib/duckdb.mjs` is at
+  ~2500 lines. Splitting is reasonable when the next risky change
+  would touch many modules at once (e.g. a decoder rework). Resist
+  splitting purely for line count.
 - **No dependencies.** Not even devDependencies if avoidable. Pure
   Bun + libduckdb is the contract.
 - **Every PR adds at least one test.** Tests live by topic in `test/`,
