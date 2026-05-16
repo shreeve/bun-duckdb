@@ -364,7 +364,7 @@ the shortcut methods (`query`, `all`, `get`, `run`, `exec`, `prepare`,
 | `db.connect()` | `Connection` | A fresh, independent Connection. |
 | `db.close()` | `Promise<void>` | Closes the database and the implicit Connection. Idempotent. Async as of v0.3 (the public handle still nulls out synchronously so `db.close(); db.handle === null` continues to hold). |
 | `db[Symbol.dispose]()` | `void` | Fires `close().catch(...)` — fire-and-forget. Enables `using db = open(...)`. |
-| `db[Symbol.asyncDispose]()` | `Promise<void>` | Awaits `close()`. Enables `await using db = open(...)`. Preferred for streaming. *(v0.3+)* |
+| `db[Symbol.asyncDispose]()` | `Promise<void>` | Awaits `close()`. Enables `await using db = open(...)`. Preferred for streaming, **and on Windows when reopening / deleting the same DB file** — see [Windows note](#windows-disposal-note) below. *(v0.3+)* |
 
 ### `Connection`
 
@@ -665,6 +665,34 @@ import fails and the test suite no-ops with `describe.skip`).
 - **Windows arm64:** not shipped — compile-only support isn't
   enough for a native/FFI package and we can't currently runtime-test
   on Windows arm64 in CI. Open an issue if you'd use it.
+
+### Windows disposal note
+
+Windows enforces exclusive file locks on open DuckDB databases — you
+cannot reopen or delete a DB file until DuckDB releases its handle.
+`using db = open(path)` calls the synchronous `Symbol.dispose`, which
+is fire-and-forget (it doesn't await the underlying async close). On
+Unix this is harmless; on Windows it means code like
+
+```js
+{ using db = open(path); await db.exec('...'); }
+const db2 = open(path);  // Windows: "file is already open"
+```
+
+races the close. If you need to reopen or delete the same file, use
+one of:
+
+```js
+// Preferred: TC39 explicit-resource-management with async dispose
+await using db = open(path);
+
+// Or just be explicit
+const db = open(path);
+try { /* ... */ } finally { await db.close(); }
+```
+
+`using` is still fine for any DB you don't reopen during its
+lifetime — which is the common case.
 
 ## Related
 
