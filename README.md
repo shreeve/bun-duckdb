@@ -2,17 +2,24 @@
 
 [![npm version](https://img.shields.io/npm/v/duckdb-bun.svg)](https://www.npmjs.com/package/duckdb-bun)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Bun ≥1.0](https://img.shields.io/badge/Bun-%E2%89%A51.0-black?logo=bun)](https://bun.sh)
+[![Bun ≥1.1](https://img.shields.io/badge/Bun-%E2%89%A51.1-black?logo=bun)](https://bun.sh)
 [![DuckDB](https://img.shields.io/badge/DuckDB-%E2%89%A51.0-yellow?logo=duckdb)](https://duckdb.org)
 [![CI](https://github.com/shreeve/duckdb-bun/actions/workflows/test.yml/badge.svg)](https://github.com/shreeve/duckdb-bun/actions/workflows/test.yml)
 [![TypeScript](https://img.shields.io/badge/TypeScript-ready-3178C6?logo=typescript)](./lib/duckdb.d.ts)
 
 > Efficient DuckDB driver for Bun, using pure FFI
 
-A Bun-native binding to DuckDB's modern C API. No native modules. No
-node-gyp. No N-API marshaling. The driver dlopens `libduckdb` directly
-through `bun:ffi` and uses DuckDB's chunk-based result API for
-column-store reads with minimal overhead.
+A Bun-native binding to DuckDB's modern C API. No `node-gyp`, no
+N-API marshaling, no install-time native build — `bun add duckdb-bun`
+just works. The driver `dlopens` `libduckdb` directly through
+`bun:ffi` and uses DuckDB's chunk-based result API for column-store
+reads with minimal overhead.
+
+(There is one piece of native code in the package: a ~30-line C shim
+that works around a `bun:ffi` limitation on Linux/Windows x64. It
+ships pre-built per platform in the npm tarball and is loaded via the
+same `bun:ffi` `dlopen` path as `libduckdb` itself — not as a Node
+addon. See [§ FFI shim — what's it for](#ffi-shim--whats-it-for).)
 
 ```bash
 bun add duckdb-bun
@@ -116,11 +123,13 @@ See [`examples/async.mjs`](./examples/async.mjs) for the full surface.
 
 `duckdb-bun` is built around four properties Bun developers actually want:
 
-- **Pure FFI, no native build.** `bun add duckdb-bun` installs a
-  ~50 KB JS file. No `gyp` step, no platform binaries to compile. The
-  only native dependency is `libduckdb` itself, which you install once
-  via your package manager (`brew install duckdb`,
-  `apt install libduckdb-dev`, etc.).
+- **Pure FFI, no install-time native build.** `bun add duckdb-bun`
+  installs a ~50 KB JS driver plus a small pre-built C shim for your
+  platform (linux x64/arm64, darwin x64/arm64, win32 x64). No `gyp`
+  step, no compiler invocation on the user's machine, no `postinstall`
+  hooks. The only thing you need to install separately is `libduckdb`
+  itself (`brew install duckdb`, `apt install libduckdb-dev`, the
+  Windows zip, etc.).
 - **Modern chunk-based API.** Each `query()` reads results as
   vector-batched chunks (typically 2048 rows per chunk) directly from
   DuckDB's column store via `Bun.ffi.read`, avoiding the per-value
