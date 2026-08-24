@@ -4,6 +4,61 @@ All notable changes documented here. Versioning follows
 [semver](https://semver.org/) — `0.x` releases may make breaking changes
 between minor versions until the `1.0.0` API freeze.
 
+## 0.8.0 — 2026-08-24
+
+**The Bun 1.4 / TypeScript-native release.** The package now ships
+TypeScript source as the runtime artifact — Bun executes it natively,
+so `lib/duckdb.ts` is simultaneously the implementation and the type
+declarations. Zero runtime behavior changes: the 243-test suite passes
+byte-identically before and after, on DuckDB 1.5.5 AND the 2.0
+nightlies.
+
+### Breaking
+
+- **`engines.bun` raised to `>=1.4.0`** (was `>=1.1.0`). Bun 1.4's
+  engine-native FFI is the certified target. The v0.8.0 driver was
+  empirically verified to still run on Bun 1.1.34–1.3.x, but those are
+  no longer supported — pin `duckdb-bun@0.7` if you're stuck on an
+  older Bun.
+
+### Changed
+
+- **`.mjs` + hand-written `.d.ts` → shipped TypeScript.**
+  `lib/duckdb.{mjs,d.ts}` and `lib/async/*.{mjs,d.ts}` are now
+  `lib/duckdb.ts` and `lib/async/*.ts`; the parallel declaration files
+  are deleted, eliminating the type-drift class of bugs entirely. All
+  public JSDoc (including per-feature "(v0.x+)" markers) moved onto
+  the source declarations. `package.json` exports gained the `"bun"`
+  condition; `types` points at the source. New `tsconfig.json`
+  (TypeScript 7, `strict`, `noUncheckedIndexedAccess`) with a
+  `bunx tsc --noEmit` CI gate on every platform lane.
+- **CI pins its toolchain**: Bun 1.4.0 exactly (was `latest`) and
+  DuckDB v1.5.5 (was v1.5.2) on the required lanes.
+- README benchmarks re-measured on Bun 1.4 + DuckDB 1.5.5 (appender:
+  100K rows ~5ms / ~20M rows/s — the engine-native FFI cut per-call
+  overhead vs the ~46ms measured on pre-1.4 Bun).
+
+### Added
+
+- **DuckDB CLI installer discovery**: `findDuckDBLibrary()` now also
+  checks `~/.duckdb/cli/latest/` (the path maintained by
+  `curl https://install.duckdb.org | sh`), after the system paths —
+  the CLI installer alone is now a complete setup.
+- **`v2-canary` CI job**: every push additionally runs the full suite
+  against the DuckDB v2 nightly libduckdb + Bun `latest`,
+  non-blocking, so a 2.x C-API break or Bun FFI regression surfaces
+  on the commit that first sees it.
+- **`_internals.libPath` / `_internals.shimPath`** — resolved library
+  locations exposed for diagnostics (unsupported surface, like the
+  rest of `_internals`).
+
+### Notes
+
+- The two load-bearing FFI workarounds (u64/BigInt handles; the C
+  shim for struct-by-value) are **unchanged and still required** on
+  Bun 1.4 — struct-by-value FFI remains open upstream
+  (oven-sh/bun#6139). See AGENTS.md for the updated status.
+
 ## 0.7.0 — 2026-05-15
 
 **AbortSignal cancellation on the async subpath.** Every async op now

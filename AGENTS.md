@@ -17,7 +17,7 @@ workarounds, and conventions for extending the driver.
            │ JS calls                         │ postMessage IPC
            ▼                                  ▼
 ┌──────────────────────────────┐  ┌────────────────────────────┐
-│ lib/duckdb.mjs               │  │ lib/async/index.mjs        │
+│ lib/duckdb.ts               │  │ lib/async/index.ts          │
 │ (main-thread driver, 1 file) │  │ (main-thread proxies only) │
 │                              │  │                            │
 │  • dlopen libduckdb via      │  │  • One Worker per Database │
@@ -29,25 +29,33 @@ workarounds, and conventions for extending the driver.
 └────────┬──────────────┬──────┘  └────────────┬───────────────┘
          │ FFI          │ FFI                  │ Worker
          ▼              ▼                      ▼
-   libduckdb     libduckdb-shim       lib/async/worker.mjs
-   (the DB)     (3 by-value funcs;        (imports lib/duckdb.mjs
+   libduckdb     libduckdb-shim       lib/async/worker.ts
+   (the DB)     (3 by-value funcs;        (imports lib/duckdb.ts
                 Linux x64 ABI fix)         and dispatches by op)
 ```
 
-The main-thread driver is one file (`lib/duckdb.mjs`, ~2500 lines)
+The main-thread driver is one file (`lib/duckdb.ts`, ~2500 lines)
 plus a ~30-line C shim. The async subpath adds ~1100 lines across
-`lib/async/{index,worker,protocol}.{mjs,d.ts}` — no second FFI
+`lib/async/{index,worker,protocol}.ts` — no second FFI
 implementation; the worker reuses the main-thread driver wholesale.
 
-No build step for users — pre-built platform-tagged shims ship in the
-npm tarball. Source-clone contributors run `make -C lib` once.
+No build step for users — Bun (≥1.4, per `engines`) executes the
+shipped TypeScript directly, and pre-built platform-tagged shims ship
+in the npm tarball. Source-clone contributors run `make -C lib` once.
+
+Since v0.8.0 the source IS the type surface: the hand-written
+`*.d.ts` files were folded into the `.ts` sources and deleted. The CI
+typecheck gate is `bunx tsc --noEmit` (TypeScript 7, `strict`,
+`noUncheckedIndexedAccess`; config in `tsconfig.json`). Tests and
+examples deliberately stay `.mjs` — they exercise the consumer view
+and import the `.ts` modules directly, which Bun resolves natively.
 
 | File | Role |
 |---|---|
-| `lib/duckdb.mjs` | The entire main-thread FFI driver — symbol declarations, type decoders, classes |
-| `lib/async/index.mjs` | Main-thread proxies for the `duckdb-bun/async` subpath |
-| `lib/async/worker.mjs` | Worker dispatcher; imports `lib/duckdb.mjs` for actual FFI |
-| `lib/async/protocol.{mjs,d.ts}` | Wire protocol constants + types + shared error registry |
+| `lib/duckdb.ts` | The entire main-thread FFI driver — symbol declarations, type decoders, classes |
+| `lib/async/index.ts` | Main-thread proxies for the `duckdb-bun/async` subpath |
+| `lib/async/worker.ts` | Worker dispatcher; imports `lib/duckdb.ts` for actual FFI |
+| `lib/async/protocol.ts` | Wire protocol constants + types + shared error registry |
 | `lib/duckdb-shim.c` | C shim wrapping 3 DuckDB functions that take `duckdb_result` by value (Linux/Windows x64 ABI workaround) |
 | `lib/Makefile` | Builds `libduckdb-shim.{so,dylib}` (platform-tagged with `TAGGED=1` for CI) |
 | `lib/build.ps1` | Windows MSVC build script — produces `libduckdb-shim.dll` (or `libduckdb-shim-win32-x64.dll` with `-Tagged`) |
@@ -62,7 +70,16 @@ npm tarball. Source-clone contributors run `make -C lib` once.
 
 **Two real bugs in Bun's FFI cause segfaults when wrapping a C library
 with opaque handles or large struct returns.** Both are worked around
-in `lib/duckdb.mjs`. **Do not revert these patterns.**
+in `lib/duckdb.ts`. **Do not revert these patterns.**
+
+Status as of Bun 1.4 (the current floor): Bun 1.4 replaced the
+TinyCC-based FFI with engine-native calls (JIT-compiled, ~3× faster),
+but **struct-by-value remains unsupported** (oven-sh/bun#6139, with
+newer reports still closed as duplicates of it), so Bug 2's shim is
+as load-bearing as ever. Bug 1's corruption was observed on the
+pre-1.4 FFI; whether 1.4 fixed it is unverified — the `u64`/BigInt
+pattern is correct on every Bun version and costs nothing, so it
+stays regardless. Re-test both only if #6139 lands upstream.
 
 These workarounds are the most valuable knowledge in this codebase.
 Anyone extending the driver, or building any other Bun FFI binding to
@@ -169,7 +186,7 @@ Place next to `libduckdb.{so,dylib,dll}`, or set `DUCKDB_SHIM_PATH`.
 ## Windows-specific notes
 
 Three things are different on Windows. All of them are in
-`lib/duckdb.mjs` and `lib/duckdb-shim.c` already; don't re-discover
+`lib/duckdb.ts` and `lib/duckdb-shim.c` already; don't re-discover
 them.
 
 ### 1. DLL load order matters (preload pattern)
@@ -181,7 +198,7 @@ first by absolute path, then load the shim. Once a DLL by the name
 `duckdb.dll` is loaded into the process, the shim's import binds to
 the already-loaded module by name.
 
-The driver already does this. The order in `lib/duckdb.mjs` is:
+The driver already does this. The order in `lib/duckdb.ts` is:
 
 1. `ddbLib = dlopen(libPath, { ...duckdb symbols })` (retained module-scope)
 2. `shimLib = dlopen(shimPath, { ...shim symbols })` (also retained)
@@ -262,7 +279,7 @@ works on Linux x64.
 1. **Find the C signature** in DuckDB's docs:
    <https://duckdb.org/docs/api/c/overview>
 2. **Add the declaration** to the `dlopen` block in
-   `lib/duckdb.mjs`. Match the FFI Declaration Rules table above.
+   `lib/duckdb.ts`. Match the FFI Declaration Rules table above.
 3. **If the function takes a struct by value** (rare — only the
    chunk-fetching trio currently does), add a shim wrapper in
    `lib/duckdb-shim.c` and rebuild the shim with `make -C lib`.
@@ -279,7 +296,7 @@ works on Linux x64.
 
 ### DuckDB → JS conversions
 
-Implemented in the chunk-decoding loop in `lib/duckdb.mjs` (`#readValue`).
+Implemented in the chunk-decoding loop in `lib/duckdb.ts` (`#readValue`).
 Each `DUCKDB_TYPE` enum value maps to a reader function that pulls the
 right primitive from chunk vector memory via `Bun.ffi.read.*`. The
 authoritative contract lives in the `#readValue` docstring; this table
@@ -314,7 +331,7 @@ is a summary. Keep them in sync when editing either.
 ### Validity (NULL) handling
 
 Each chunk vector has a validity bitmap — one bit per row, 1 = valid,
-0 = NULL. Decoded via `isValid(validityPtr, row)` in `lib/duckdb.mjs`.
+0 = NULL. Decoded via `isValid(validityPtr, row)` in `lib/duckdb.ts`.
 Always check before reading the value bytes.
 
 ### String layout
@@ -345,7 +362,7 @@ receive the abort event).
    Map<connId, { ptr, generation }>`.
 3. `AsyncConnection.#runSerial` wraps every op with an abort listener
    that — when fired during an active op — calls `duckdb_interrupt(ptr)`
-   from the main thread via the new FFI binding in `lib/duckdb.mjs`
+   from the main thread via the new FFI binding in `lib/duckdb.ts`
    (exposed through the internal `_internals` export).
 4. Bun Workers share the process's libduckdb state, so the main
    thread calling `duckdb_interrupt` on a worker-owned connection
@@ -512,7 +529,7 @@ unbounded amounts of DuckDB memory.
 
 1. Read the release notes for any C API additions/deprecations.
 2. Check `duckdb.h` for any signature changes to functions already
-   declared in `lib/duckdb.mjs`.
+   declared in `lib/duckdb.ts`.
 3. If new types were added (rare), extend the `DUCKDB_TYPE` map and
    the chunk-decoding switch.
 4. Run `bun test` against the new libduckdb.
@@ -521,7 +538,7 @@ unbounded amounts of DuckDB memory.
 
 ## Conventions
 
-- **One file for the main-thread driver.** `lib/duckdb.mjs` is at
+- **One file for the main-thread driver.** `lib/duckdb.ts` is at
   ~2500 lines. Splitting is reasonable when the next risky change
   would touch many concerns at once (e.g. a decoder rework); resist
   splitting purely for line count. The async subpath lives in

@@ -35,10 +35,10 @@ If `libduckdb` isn't installed, `bun test` skips cleanly via
 
 | What | Where |
 |---|---|
-| Main-thread driver | `lib/duckdb.mjs` (~2500 lines, single file) |
-| Async-subpath proxy | `lib/async/{index,worker,protocol}.{mjs,d.ts}` |
+| Main-thread driver | `lib/duckdb.ts` (~2600 lines, single file; Bun executes the TypeScript directly) |
+| Async-subpath proxy | `lib/async/{index,worker,protocol}.ts` |
 | FFI shim source | `lib/duckdb-shim.c` (works around a Bun struct-by-value ABI bug); Windows MSVC build in `lib/build.ps1` |
-| TypeScript declarations | `lib/duckdb.d.ts`, `lib/async/*.d.ts` (hand-written) |
+| Types | In the source itself (since v0.8.0 — no separate `.d.ts`); gate is `bunx tsc --noEmit` (strict, TS 7, `tsconfig.json`) |
 | Tests, by topic | `test/{lifecycle,queries,statements,transactions,types,appender,errors,iterate,options}.test.mjs` |
 | Async tests | `test/async/{async,cancel}.test.mjs` |
 | Shared test setup | `test/helpers.mjs` |
@@ -48,14 +48,16 @@ If `libduckdb` isn't installed, `bun test` skips cleanly via
 
 ## Conventions
 
-- **Pure ESM, no build step for the JS.** `lib/duckdb.mjs` is shipped
-  as-is. The TypeScript declarations are hand-maintained.
-- **One file for the main-thread driver.** `lib/duckdb.mjs` is at
-  ~2500 lines. Splitting is reasonable when the next risky change
+- **Pure ESM TypeScript, no build step.** `lib/duckdb.ts` is shipped
+  as-is; Bun executes it natively, and the types live in the source
+  (`bunx tsc --noEmit` must stay clean — CI gates on it).
+- **One file for the main-thread driver.** `lib/duckdb.ts` is at
+  ~2600 lines. Splitting is reasonable when the next risky change
   would touch many modules at once (e.g. a decoder rework). Resist
   splitting purely for line count.
-- **No dependencies.** Not even devDependencies if avoidable. Pure
-  Bun + libduckdb is the contract.
+- **No runtime dependencies.** Pure Bun + libduckdb is the contract.
+  The only devDependencies are `typescript` + `@types/bun` for the
+  typecheck gate — nothing executes at runtime but Bun itself.
 - **Every PR adds at least one test.** Tests live by topic in `test/`,
   not by code module.
 - **No ORM features.** This is a driver. Models, migrations, query
@@ -71,15 +73,15 @@ If `libduckdb` isn't installed, `bun test` skips cleanly via
 
 1. Find the C signature in DuckDB's docs:
    <https://duckdb.org/docs/api/c/overview>
-2. Add the FFI declaration to the `dlopen` block in `lib/duckdb.mjs`.
+2. Add the FFI declaration to the `dlopen` block in `lib/duckdb.ts`.
    Match the **FFI Declaration Rules** table in `AGENTS.md`.
 3. If the function takes a struct by value, add a wrapper to
    `lib/duckdb-shim.c` and rebuild with `make -C lib`.
 4. Wire the JS API as a method on `Database`, `Connection`, or
-   `Statement`. Always go through `withLock(...)` for connection-
-   level operations.
-5. Add type declarations in `lib/duckdb.d.ts`.
-6. Add at least one test in the appropriate `test/*.test.mjs` file.
+   `Statement`, with its types inline in the source. Always go through
+   `withLock(...)` for connection-level operations, and keep
+   `bunx tsc --noEmit` clean.
+5. Add at least one test in the appropriate `test/*.test.mjs` file.
 
 ## Reporting bugs
 

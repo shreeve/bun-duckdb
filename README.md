@@ -6,10 +6,10 @@
 
 [![npm version](https://img.shields.io/npm/v/duckdb-bun.svg)](https://www.npmjs.com/package/duckdb-bun)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Bun ≥1.1](https://img.shields.io/badge/Bun-%E2%89%A51.1-black?logo=bun)](https://bun.sh)
-[![DuckDB](https://img.shields.io/badge/DuckDB-%E2%89%A51.0-yellow?logo=duckdb)](https://duckdb.org)
+[![Bun ≥1.4](https://img.shields.io/badge/Bun-%E2%89%A51.4-black?logo=bun)](https://bun.sh)
+[![DuckDB](https://img.shields.io/badge/DuckDB-1.x%20%7C%202.x--ready-yellow?logo=duckdb)](https://duckdb.org)
 [![CI](https://github.com/shreeve/duckdb-bun/actions/workflows/test.yml/badge.svg)](https://github.com/shreeve/duckdb-bun/actions/workflows/test.yml)
-[![TypeScript](https://img.shields.io/badge/TypeScript-ready-3178C6?logo=typescript)](./lib/duckdb.d.ts)
+[![TypeScript](https://img.shields.io/badge/TypeScript-native-3178C6?logo=typescript)](./lib/duckdb.ts)
 
 > Efficient DuckDB driver for Bun, using pure FFI
 
@@ -18,6 +18,18 @@ N-API marshaling, no install-time native build — `bun add duckdb-bun`
 just works. The driver `dlopens` `libduckdb` directly through
 `bun:ffi` and uses DuckDB's chunk-based result API for column-store
 reads with minimal overhead.
+
+The package ships **TypeScript source as the runtime artifact** —
+Bun executes `.ts` natively, so `lib/duckdb.ts` is simultaneously the
+implementation and the type declarations. There is no build step, no
+generated `.d.ts` to drift out of sync, and go-to-definition lands in
+the real code. Requires Bun ≥ 1.4 (whose engine-native FFI also makes
+every call cheaper — see [§ Performance notes](#performance-notes)).
+
+Because it binds DuckDB's **stable C API** (frozen since v1.2, and
+spec-versioned in the upcoming DuckDB 2.0), one shipped driver spans
+DuckDB versions: the same code is CI-tested against DuckDB 1.5.5 and
+the 2.0 nightlies with zero version branches.
 
 (There is one piece of native code in the package: a ~30-line C shim
 that works around a `bun:ffi` limitation on Linux/Windows x64. It
@@ -130,14 +142,14 @@ See [`examples/async.mjs`](./examples/async.mjs) for the full surface.
 
 | Option | Problem on Bun |
 |---|---|
-| `@duckdb/node-api` (official, N-API) | Native build required (node-gyp install dance), value-by-value marshaling overhead, verbose API designed for Node |
+| `@duckdb/node-api` (official, N-API) | No Bun support upstream (Bun's NAPI layer has a history of DuckDB segfaults, fixed over 2025-26), `bun build --compile` with NAPI addons is still broken ([bun#17312](https://github.com/oven-sh/bun/issues/17312)), value-by-value marshaling overhead, one package release per DuckDB version |
 | `@duckdb/duckdb-wasm` | Browser-only — full DuckDB inside a 6 MB Wasm module is overkill for server-side Bun |
 | `node-duckdb` (older) | Abandoned, last release before the chunk API |
 
-`duckdb-bun` is built around four properties Bun developers actually want:
+`duckdb-bun` is built around five properties Bun developers actually want:
 
 - **Pure FFI, no install-time native build.** `bun add duckdb-bun`
-  installs a ~50 KB JS driver plus a small pre-built C shim for your
+  installs a ~90 KB TypeScript driver plus a small pre-built C shim for your
   platform (linux x64/arm64, darwin x64/arm64, win32 x64). No `gyp`
   step, no compiler invocation on the user's machine, no `postinstall`
   hooks. The only thing you need to install separately is `libduckdb`
@@ -148,7 +160,14 @@ See [`examples/async.mjs`](./examples/async.mjs) for the full surface.
   DuckDB's column store via `Bun.ffi.read`, avoiding the per-value
   N-API roundtrips that make older Node bindings slow.
 - **Bun-native, not a Node compatibility shim.** Uses `bun:ffi`
-  directly. No emulation layer, no Node FFI quirks.
+  directly — TypeScript source executed natively, no emulation layer,
+  no Node FFI quirks. Works inside `bun build --compile` binaries
+  (runtime `dlopen` needs no NAPI addon support).
+- **Version-independent by construction.** Binds only DuckDB's stable
+  C API (guaranteed since v1.2; spec-frozen in 2.0), so one shipped
+  driver runs against DuckDB 1.5.x and 2.x without a release. CI pins
+  1.5.5 and additionally runs every commit against the DuckDB v2
+  nightlies as a canary.
 - **Working on Linux x86_64.** Bun's FFI has two real bugs that bite
   any C library wrapper: opaque-handle-as-`'ptr'` arguments get
   corrupted (segfault at `0xFFFFFFFFFFFFFFFF`), and structs-by-value
@@ -172,15 +191,24 @@ automatically:
 macOS:    /opt/homebrew/lib/libduckdb.dylib
           /usr/local/lib/libduckdb.dylib
           /usr/lib/libduckdb.dylib
+          ~/.duckdb/cli/latest/libduckdb.dylib   (DuckDB CLI installer)
 
 Linux:    /usr/lib/libduckdb.so
           /usr/local/lib/libduckdb.so
           /usr/lib/x86_64-linux-gnu/libduckdb.so
           /usr/lib/aarch64-linux-gnu/libduckdb.so
+          ~/.duckdb/cli/latest/libduckdb.so      (DuckDB CLI installer)
 
 Windows:  C:\Program Files\DuckDB\duckdb.dll
           duckdb.dll  (in PATH)
+          ~\.duckdb\cli\latest\duckdb.dll        (DuckDB CLI installer)
 ```
+
+The `~/.duckdb/cli/latest` entries mean the official CLI installer
+(`curl https://install.duckdb.org | sh`) is a complete install on its
+own — it ships `libduckdb` beside the CLI and keeps `latest` pointing
+at the current version. A deliberate brew/apt/manual install still
+wins when both exist.
 
 Override with `DUCKDB_LIB_PATH=/your/path/libduckdb.so` (on Windows:
 `$env:DUCKDB_LIB_PATH = "C:\path\to\duckdb.dll"`).
@@ -188,6 +216,9 @@ Override with `DUCKDB_LIB_PATH=/your/path/libduckdb.so` (on Windows:
 ### Installing libduckdb
 
 ```bash
+# Any platform — official DuckDB CLI installer (ships libduckdb too)
+curl https://install.duckdb.org | sh
+
 # macOS
 brew install duckdb
 
@@ -304,8 +335,10 @@ For bulk insert see [`examples/appender.mjs`](./examples/appender.mjs).
 
 ## TypeScript
 
-Type declarations ship with the package — `import` works in TS without
-extra setup, and `db.query<T>(sql)` lets you narrow the row shape:
+The driver **is** TypeScript — `lib/duckdb.ts` is the shipped runtime
+artifact, so the types are the implementation, checked in CI with
+`tsc --noEmit` under `strict`. `import` works in TS without extra
+setup, and `db.query<T>(sql)` lets you narrow the row shape:
 
 ```ts
 import { open, type QueryResult, type Statement } from 'duckdb-bun';
@@ -572,9 +605,11 @@ SQL casts: `'SELECT CAST(? AS UINTEGER)'`.
 - **Appender is dramatically faster than parameterized INSERT.** For
   loading thousands+ rows, use `conn.append(...)` instead of looping
   on `INSERT VALUES (?, ?, ...)`.
-  - On a 2024 M-series Mac: **100,000 rows inserted in ~46ms**
-    (TIMESTAMP + INTEGER + DOUBLE columns) via Appender vs many
-    seconds for the equivalent loop of single-row INSERTs.
+  - On an M-series Mac (Bun 1.4, DuckDB 1.5.5): **100,000 rows
+    appended in ~5ms (~20M rows/s)** vs many seconds for the
+    equivalent loop of single-row INSERTs. (Bun 1.4's engine-native
+    FFI — JIT-compiled direct C calls — cut the driver's per-call
+    overhead substantially vs the ~46ms measured on earlier Bun.)
 - **Internal serialization lock.** Concurrent calls into a single
   `Connection` are serialized through a JS-level promise lock to
   match DuckDB's per-connection threading model. Use multiple
@@ -586,8 +621,12 @@ SQL casts: `'SELECT CAST(? AS UINTEGER)'`.
   mechanism, not a true off-thread runner — long-running analytical
   queries still block the Bun event loop while they execute. For a
   truly off-thread interface, use `duckdb-bun/async` (Worker-backed;
-  same API surface, ~25% latency tax on small queries, but the main
-  event loop stays responsive).
+  same API surface, but the main event loop stays responsive).
+  Measured on Bun 1.4 + DuckDB 1.5.5: trivial `SELECT 1` round-trips
+  run ~31k ops/s sync vs ~19k ops/s async (the postMessage hop);
+  1M-row materialization is 29ms sync vs 175ms async (rows cross the
+  Worker boundary). The async tax only matters for tiny/hot queries —
+  for the long analytical queries it exists for, it's noise.
 
 ## Examples
 
@@ -637,6 +676,15 @@ benchmarks, and design notes), see [CHANGELOG.md](./CHANGELOG.md).
   `DuckDBAbortError` class. AsyncDatabase shortcuts route through a
   lazy implicit `AsyncConnection` for stable cancellation identity.
   Per-conn serialization on the main thread.
+- **v0.8.0** — The Bun 1.4 / TypeScript-native release. Source
+  migrated from `.mjs` + hand-written `.d.ts` to shipped TypeScript
+  (`lib/duckdb.ts` is both implementation and types; strict
+  `tsc --noEmit` CI gate; `bun` export condition). Bun floor raised
+  to ≥1.4 (engine-native FFI). libduckdb discovery learns the DuckDB
+  CLI installer path (`~/.duckdb/cli/latest`). CI: pinned Bun 1.4.0 +
+  DuckDB 1.5.5 required lanes, plus a non-blocking DuckDB v2-nightly
+  canary — the suite passes on both engines today. Benchmarks
+  refreshed on Bun 1.4.
 
 ### Planned
 
@@ -681,7 +729,8 @@ The driver stays a driver. Higher layers belong in separate packages.
 ```bash
 git clone https://github.com/shreeve/duckdb-bun
 cd duckdb-bun
-bun install                  # no deps actually, just for lockfile
+bun install                  # dev deps: typescript + @types/bun (typecheck only)
+bunx tsc --noEmit            # strict typecheck (the CI gate)
 bun test                     # requires libduckdb installed
 make -C lib                  # builds libduckdb-shim for current platform
 ```
@@ -697,11 +746,15 @@ import fails and the test suite no-ops with `describe.skip`).
 
 ## Compatibility
 
-- **Bun:** ≥ 1.1 (Bun added Windows support in 1.1; 1.0 still works on
-  Linux/macOS but the package now declares 1.1 as the minimum so the
-  npm metadata matches reality)
-- **DuckDB:** any modern release with the chunk API (≥ v0.10
-  recommended; tested against v1.5.x)
+- **Bun:** ≥ 1.4 (v0.8.0+). Bun 1.4's engine-native FFI is the
+  certified target — CI pins it exactly, plus a `latest` canary lane.
+  (The driver itself was empirically verified on Bun 1.1–1.3 as of
+  v0.8.0, but those versions are no longer supported or tested; use
+  duckdb-bun ≤0.7 if you're pinned to an older Bun.)
+- **DuckDB:** any release with the stable C API (≥ v1.2 formally;
+  chunk API back to v0.10 in practice). CI certifies **v1.5.5** and
+  runs a non-blocking canary against the **v2.0 nightlies** — the full
+  suite currently passes on both.
 - **Platforms (shipped shims):** macOS arm64, macOS x64, Linux x64,
   Linux arm64, Windows x64
 - **Windows arm64:** not shipped — compile-only support isn't
