@@ -34,7 +34,7 @@ try {
     Database: _Database,
     Connection: _Connection,
     Statement: _Statement,
-  } = await import('../lib/duckdb.mjs'));
+  } = await import('../lib/duckdb.ts'));
   _available = true;
 } catch {
   // libduckdb not installed — exported describe is .skip below.

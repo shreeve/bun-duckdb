@@ -10,7 +10,7 @@ import { join } from 'path';
 let mod;
 let available = false;
 try {
-  mod = await import('../../lib/async/index.mjs');
+  mod = await import('../../lib/async/index.ts');
   available = true;
 } catch (e) {
   // libduckdb not present — tests skip via describe.skip below.

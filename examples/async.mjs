@@ -7,7 +7,7 @@
 // Run:
 //   bun examples/async.mjs
 
-import { open } from '../lib/async/index.mjs';
+import { open } from '../lib/async/index.ts';
 
 // `await using` is the right dispose pattern — the worker takes a few
 // ms to drain on close, and we want to wait for that before the script

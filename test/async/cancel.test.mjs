@@ -21,7 +21,7 @@ import { test, expect, describe } from 'bun:test';
 let mod;
 let available = false;
 try {
-  mod = await import('../../lib/async/index.mjs');
+  mod = await import('../../lib/async/index.ts');
   available = true;
 } catch {
   // libduckdb not present — tests skip.

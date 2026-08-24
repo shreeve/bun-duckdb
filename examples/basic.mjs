@@ -6,7 +6,7 @@
 // Run:
 //   bun examples/basic.mjs
 
-import { open, version } from '../lib/duckdb.mjs';
+import { open, version } from '../lib/duckdb.ts';
 
 console.log(`DuckDB ${version()}`);
 

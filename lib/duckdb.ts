@@ -6,7 +6,7 @@
  * tiny C shim (`lib/duckdb-shim.c`) for the three by-value DuckDB
  * functions that Bun's FFI can't marshal directly on Linux x64.
  *
- * For the Worker-backed off-thread API, see `lib/async/index.mjs`
+ * For the Worker-backed off-thread API, see `lib/async/index.ts`
  * (consumed via `import { open } from 'duckdb-bun/async'`).
  *
  * Usage:
@@ -15,28 +15,40 @@
  *   await using db = open(':memory:');
  *   const rows = await db.all('SELECT 42 AS n');
  *
- * Public API contract: see lib/duckdb.d.ts. Architecture notes
+ * Public API contract: the exported types in this file (this package
+ * ships TypeScript source directly — no build step). Architecture notes
  * (FFI quirks, locking model, type contract): see AGENTS.md.
  */
 
-import { dlopen, ptr, CString, read as ffiRead } from 'bun:ffi';
+import { dlopen, ptr, CString, read as ffiRead, type Pointer } from 'bun:ffi';
 import { platform, arch } from 'process';
 import { existsSync, realpathSync } from 'fs';
-import { dirname } from 'path';
+import { homedir } from 'os';
+import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
 // ==============================================================================
 // Find DuckDB Library
 // ==============================================================================
 
-function findDuckDBLibrary() {
-  const candidates = [];
+function findDuckDBLibrary(): string {
+  const candidates: string[] = [];
+
+  // The official DuckDB CLI installer (`curl https://install.duckdb.org | sh`)
+  // ships libduckdb + headers alongside the CLI and maintains a `latest`
+  // symlink as its updater rolls versions. Checked AFTER the system paths so
+  // a deliberate brew/apt/manual install always wins over the CLI's cache.
+  const cliManaged = join(
+    homedir(), '.duckdb', 'cli', 'latest',
+    platform === 'win32' ? 'duckdb.dll' : `libduckdb.${platform === 'darwin' ? 'dylib' : 'so'}`,
+  );
 
   if (platform === 'darwin') {
     candidates.push(
       '/opt/homebrew/lib/libduckdb.dylib',
       '/usr/local/lib/libduckdb.dylib',
       '/usr/lib/libduckdb.dylib',
+      cliManaged,
     );
   } else if (platform === 'linux') {
     candidates.push(
@@ -44,11 +56,13 @@ function findDuckDBLibrary() {
       '/usr/local/lib/libduckdb.so',
       '/usr/lib/x86_64-linux-gnu/libduckdb.so',
       '/usr/lib/aarch64-linux-gnu/libduckdb.so',
+      cliManaged,
     );
   } else if (platform === 'win32') {
     candidates.push(
       'C:\\Program Files\\DuckDB\\duckdb.dll',
       'duckdb.dll',
+      cliManaged,
     );
   }
 
@@ -72,7 +86,11 @@ const libPath = findDuckDBLibrary();
 // Load DuckDB C API
 // ==============================================================================
 //
-// Bun FFI on Linux x64 has two bugs:
+// Bun FFI on Linux x64 has two bugs (observed on the TinyCC-based FFI
+// through Bun 1.3.x; Bun 1.4 replaced FFI internals with engine-native
+// calls, but struct-by-value remains unsupported — oven-sh/bun#6139 —
+// and the u64/BigInt handle pattern below is correct on every version,
+// so BOTH workarounds stay):
 //   1. Passing a JS number as a 'ptr' argument corrupts the value — use 'u64' + BigInt
 //   2. Cannot pass structs by value (e.g. 48-byte duckdb_result) — needs C shim
 //
@@ -249,7 +267,7 @@ function findShimLibrary() {
 
   // Use path.dirname / fileURLToPath for cross-platform correctness — the
   // regex-based dirname extraction in earlier versions only handled '/' and
-  // would fail on Windows ('C:\\...\\lib\\duckdb.mjs').
+  // would fail on Windows ('C:\\...\\lib\\duckdb.ts').
   const realLibPath = realpathSync(libPath);
   const realLibDir = dirname(realLibPath);
   const symLibDir = dirname(libPath);
@@ -261,7 +279,7 @@ function findShimLibrary() {
     `${driverDir}/${untaggedName}`,               // local build output next to driver
     `${realLibDir}/${untaggedName}`,              // historical: next to real libduckdb
     `${symLibDir}/${untaggedName}`,               // historical: next to symlinked libduckdb
-  ].filter(Boolean);
+  ].filter(Boolean) as string[];
 
   for (const p of candidates) {
     if (existsSync(p)) return p;
@@ -285,8 +303,8 @@ const directFetchLib = !shim ? dlopen(libPath, {
   duckdb_fetch_chunk: { args: ['ptr'], returns: 'u64' },
 }) : null;
 const fetchChunk = shim
-  ? (rp) => shim.shim_fetch_chunk(rp)
-  : (rp) => directFetchLib.symbols.duckdb_fetch_chunk(rp);
+  ? (rp: Pointer) => shim.shim_fetch_chunk(rp)
+  : (rp: Pointer) => directFetchLib!.symbols.duckdb_fetch_chunk(rp);
 
 // ==============================================================================
 // DuckDB Type Constants
@@ -328,9 +346,170 @@ const DUCKDB_TYPE = {
   UHUGEINT: 32,
   ARRAY: 33,
   TIME_NS: 39,
-};
+} as const;
 
 export { DUCKDB_TYPE };
+
+export type DuckDBTypeCode = (typeof DUCKDB_TYPE)[keyof typeof DUCKDB_TYPE];
+
+// ==============================================================================
+// Public type surface
+//
+// Carried over from the hand-written lib/duckdb.d.ts (now retired — this
+// file ships TypeScript source directly). Generic parameters let users
+// tighten row shapes when they know them; defaults are loose
+// (`Record<string, unknown>`) for ad-hoc queries.
+//
+// Per-feature "introduced in" markers in JSDoc comments (e.g. *(v0.5+)*)
+// trace each method back to its release. See CHANGELOG.md for full
+// release notes.
+// ==============================================================================
+
+/** A single row from a query — keys are column names. */
+export type Row = Record<string, unknown>;
+
+/** Bind parameters for a prepared statement (positional). */
+export type Params = readonly unknown[];
+
+/** DuckDB access mode (v0.5+). Maps to the `access_mode` config key. */
+export type DuckDBAccessMode = 'AUTOMATIC' | 'READ_ONLY' | 'READ_WRITE';
+
+/**
+ * Options accepted by `open(path, opts?)` (v0.5+). Common settings are
+ * exposed as typed fields; arbitrary DuckDB config keys can be set via
+ * the `config` escape hatch. Typed options + `config` setting the same
+ * DuckDB key with different values throws; matching values are allowed.
+ */
+export interface OpenOptions {
+  /** Sugar for `accessMode: 'READ_ONLY'`. */
+  readOnly?: boolean;
+  /** DuckDB `access_mode` (maps directly). */
+  accessMode?: DuckDBAccessMode;
+  /** DuckDB `threads` (positive integer). */
+  threads?: number;
+  /** DuckDB `memory_limit` (e.g. `'1GB'`, `'512MB'`, `'80%'`). */
+  memoryLimit?: string;
+  /** DuckDB `temp_directory`. */
+  tempDirectory?: string;
+  /** Escape hatch: any DuckDB config key + value not exposed above. */
+  config?: Record<string, string | number | boolean | bigint>;
+}
+
+/** Options for `checkpoint()` (v0.5.1+). */
+export interface CheckpointOptions {
+  /**
+   * Emit `FORCE CHECKPOINT` — checkpoints even with active transactions
+   * present (they are ABORTed). Default: false.
+   */
+  force?: boolean;
+  /**
+   * Target a specific attached database by name (when you've used
+   * `ATTACH '...' AS aux`). Strictly validated as an identifier.
+   */
+  database?: string;
+}
+
+/** Yielded by `chunks()` iterators (v0.5+). */
+export interface RowChunk<T extends Row = Row> {
+  /** Decoded rows for this chunk. Also exposes `.columns` (same as QueryResult). */
+  rows: T[] & { columns?: ColumnInfo[] };
+  /** 0-based index of this chunk in the stream. */
+  chunkIndex: number;
+  /** Number of rows yielded before this chunk's first row. */
+  rowOffset: number;
+}
+
+/**
+ * A scoped transaction handle (v0.5+) passed to the `db.transaction(fn)`
+ * callback. Same shortcut methods as Connection, but using the handle
+ * after the callback returns/throws raises DuckDBTransactionError.
+ *
+ * Nested transactions are not currently supported (DuckDB v1.5.2
+ * doesn't parse SAVEPOINT); `tx.transaction()` always rejects with
+ * DuckDBTransactionError. The method is reserved for forward-compat
+ * when upstream lands SAVEPOINT.
+ */
+export interface TxnHandle {
+  query<T extends Row = Row>(sql: string, params?: Params): Promise<QueryResult<T>>;
+  all<T extends Row = Row>(sql: string, params?: Params): Promise<QueryResult<T>>;
+  get<T extends Row = Row>(sql: string, params?: Params): Promise<T | undefined>;
+  run(sql: string, params?: Params): Promise<RunResult>;
+  exec(sql: string): Promise<void>;
+  prepare<T extends Row = Row>(sql: string): Promise<Statement<T>>;
+  iterate<T extends Row = Row>(sql: string, params?: Params): AsyncIterableIterator<T>;
+  chunks<T extends Row = Row>(sql: string, params?: Params): AsyncIterableIterator<RowChunk<T>>;
+  pragma(name: string, value?: string | number | boolean | bigint | null): Promise<Row | undefined>;
+  installExtension(name: string): Promise<void>;
+  loadExtension(name: string): Promise<void>;
+  checkpoint(opts?: CheckpointOptions): Promise<void>;
+  append(table: string, columns: string[], rows: unknown[][]): Promise<AppendResult>;
+  executeBatchPrepared(sql: string, batches: unknown[][]): Promise<AppendResult>;
+  /** Always rejects with DuckDBTransactionError until upstream SAVEPOINT support lands. */
+  transaction<R>(fn: (tx: TxnHandle) => Promise<R>): Promise<R>;
+}
+
+/** Column metadata attached to QueryResult. */
+export interface ColumnInfo {
+  name: string;
+  /** DuckDB internal type code (matches a DUCKDB_TYPE value). */
+  type: number;
+  /** DuckDB type name as a string (e.g. "INTEGER", "VARCHAR"). */
+  typeName: string;
+  /** Logical type metadata for complex types (DECIMAL, ENUM, LIST, STRUCT, MAP, ARRAY). */
+  logicalType?: unknown;
+}
+
+// Internal superset of ColumnInfo: per-type decode metadata attached by
+// _decodeColumnsMetadata (decimal width/scale, enum dictionary, nested
+// child types, ...). Present at runtime on returned columns but not part
+// of the documented public contract.
+interface InternalColumnInfo extends ColumnInfo {
+  decimalWidth?: number;
+  decimalScale?: number;
+  decimalInternalType?: number;
+  enumInternalType?: number;
+  enumDict?: (string | null)[];
+  childType?: number;
+  structChildren?: { name: string; type: number }[];
+  keyType?: number;
+  valueType?: number;
+  arraySize?: number;
+}
+
+/**
+ * What `query()` / `all()` resolve to: an Array of rows with two extra
+ * properties attached. Treat the value as the rows themselves; spread,
+ * iterate, index — `.columns` and `.rowsChanged` are sidecar metadata.
+ */
+export type QueryResult<T extends Row = Row> = T[] & {
+  /** Column metadata (one entry per result column, in column order). */
+  columns: ColumnInfo[];
+  /**
+   * Number of rows changed by a DML statement (INSERT/UPDATE/DELETE).
+   * Always 0n for SELECT or DDL. BigInt because DuckDB returns uint64.
+   */
+  rowsChanged: bigint;
+};
+
+/** Result of a non-row-returning execution. */
+export interface RunResult {
+  rowsChanged: bigint;
+}
+
+/** Result of an Appender bulk insert. */
+export interface AppendResult {
+  rows: number;
+}
+
+// Internal: the iterator wrappers constructed by Statement.iterate() /
+// Statement.chunks() always implement next/return/throw, unlike the
+// optional members of the base AsyncIterableIterator interface. Typing
+// the active-iterator slots with this lets close() call `.return()`
+// without optional-call ceremony.
+interface ActiveIterator<T = any> extends AsyncIterableIterator<T> {
+  return(value?: any): Promise<IteratorResult<T, any>>;
+  throw(e?: any): Promise<IteratorResult<T, any>>;
+}
 
 // ==============================================================================
 // Error classes
@@ -342,13 +521,19 @@ export { DUCKDB_TYPE };
 // ==============================================================================
 
 export class DuckDBError extends Error {
-  constructor(message) {
+  declare readonly name:
+    | 'DuckDBError' | 'DuckDBClosedError' | 'DuckDBPrepareError'
+    | 'DuckDBTransactionError' | 'AbortError' | 'DuckDBWorkerCrashedError';
+
+  constructor(message?: string) {
     super(message);
     this.name = 'DuckDBError';
   }
 }
 
 export class DuckDBClosedError extends DuckDBError {
+  declare readonly name: 'DuckDBClosedError';
+
   constructor(what = 'resource') {
     super(`${what} is closed`);
     this.name = 'DuckDBClosedError';
@@ -356,14 +541,18 @@ export class DuckDBClosedError extends DuckDBError {
 }
 
 export class DuckDBPrepareError extends DuckDBError {
-  constructor(message) {
+  declare readonly name: 'DuckDBPrepareError';
+
+  constructor(message?: string) {
     super(message);
     this.name = 'DuckDBPrepareError';
   }
 }
 
 export class DuckDBTransactionError extends DuckDBError {
-  constructor(message) {
+  declare readonly name: 'DuckDBTransactionError';
+
+  constructor(message?: string) {
     super(message);
     this.name = 'DuckDBTransactionError';
   }
@@ -379,6 +568,9 @@ export class DuckDBTransactionError extends DuckDBError {
 // AbortSignal because sync FFI blocks the JS event loop — the abort
 // listener can't fire until the query returns.
 export class DuckDBAbortError extends DuckDBError {
+  declare readonly name: 'AbortError';
+  declare readonly code: 'ERR_DUCKDB_ABORTED';
+
   constructor(message = 'Query aborted') {
     super(message);
     this.name = 'AbortError';
@@ -411,11 +603,11 @@ export class DuckDBAbortError extends DuckDBError {
 // ==============================================================================
 
 class AsyncMutex {
-  #tail = Promise.resolve();
+  #tail: Promise<void> = Promise.resolve();
 
-  withLock(fn) {
+  withLock<T>(fn: () => T): Promise<T> {
     const prev = this.#tail;
-    let resolve;
+    let resolve!: () => void;
     this.#tail = new Promise(r => { resolve = r; });
     return prev.then(() => {
       try { return fn(); }
@@ -423,9 +615,9 @@ class AsyncMutex {
     });
   }
 
-  async acquire() {
+  async acquire(): Promise<() => void> {
     const prev = this.#tail;
-    let resolve;
+    let resolve!: () => void;
     this.#tail = new Promise(r => { resolve = r; });
     await prev;
     return resolve; // caller invokes this to release
@@ -435,20 +627,24 @@ class AsyncMutex {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-function toCString(str) {
+function toCString(str: string): Uint8Array {
   return encoder.encode(str + '\0');
 }
 
-function fromCString(p) {
+function fromCString(p: Pointer | number | bigint | null): string | null {
   if (!p) return null;
+  // Bun <1.4: CString is a String subclass carrying .ptr — .toString()
+  // detaches a plain string. Bun ≥1.4 (engine-native FFI): CString IS a
+  // plain string already, and .toString() is an identity no-op. One body
+  // serves the whole supported range; do not "simplify" either half away.
   return new CString(p).toString();
 }
 
-function allocPtr() {
+function allocPtr(): Uint8Array {
   return new Uint8Array(8);
 }
 
-function readHandle(buf) {
+function readHandle(buf: Uint8Array): bigint {
   return new DataView(buf.buffer).getBigUint64(0, true);
 }
 
@@ -462,7 +658,7 @@ function readHandle(buf) {
 //
 // We always copy out of DuckDB-owned memory so the returned Uint8Array
 // is safe to retain across chunk destruction.
-function readBytes(dataPtr, row) {
+function readBytes(dataPtr: number, row: number): Uint8Array | null {
   if (!dataPtr) return null;
   const offset = row * 16;
   const length = ffiRead.u32(dataPtr, offset);
@@ -484,13 +680,13 @@ function readBytes(dataPtr, row) {
 // Read a duckdb_string_t as a UTF-8 string. For BLOB (binary data) use
 // readBytes() instead — TextDecoder will replace invalid UTF-8 with
 // U+FFFD and corrupt the bytes.
-function readString(dataPtr, row) {
+function readString(dataPtr: number, row: number): string | null {
   const bytes = readBytes(dataPtr, row);
   return bytes === null ? null : decoder.decode(bytes);
 }
 
 // Check if a row is valid (not NULL) in a validity mask
-function isValid(validityPtr, row) {
+function isValid(validityPtr: number, row: number): boolean {
   if (!validityPtr) return true;  // NULL validity = all valid
   const entryIdx = Math.floor(row / 64);
   const bitIdx = row % 64;
@@ -513,7 +709,7 @@ function isValid(validityPtr, row) {
 // ==============================================================================
 
 // Maps typed OpenOptions fields → DuckDB config keys + value renderer.
-const TYPED_OPTION_MAP = {
+const TYPED_OPTION_MAP: Record<string, { key: string; render: (v: unknown) => string }> = {
   accessMode:    { key: 'access_mode',     render: (v) => String(v) },
   threads:       { key: 'threads',         render: (v) => {
     if (typeof v !== 'number' || !Number.isInteger(v) || v <= 0) {
@@ -535,10 +731,10 @@ const TYPED_OPTION_MAP = {
   } },
 };
 
-function normalizeOpenOptions(opts) {
+function normalizeOpenOptions(opts: OpenOptions): Map<string, string> {
   // Map<duckdbKey, value>. Keep insertion order so error messages name
   // the first occurrence on a conflict.
-  const out = new Map();
+  const out = new Map<string, string>();
 
   // 1. readOnly is sugar for access_mode=READ_ONLY.
   if (opts.readOnly !== undefined) {
@@ -554,11 +750,11 @@ function normalizeOpenOptions(opts) {
 
   // 2. Other typed options.
   for (const [field, { key, render }] of Object.entries(TYPED_OPTION_MAP)) {
-    if (opts[field] === undefined) continue;
-    const rendered = render(opts[field]);
+    if ((opts as Record<string, unknown>)[field] === undefined) continue;
+    const rendered = render((opts as Record<string, unknown>)[field]);
     if (out.has(key) && out.get(key) !== rendered) {
       throw new DuckDBError(
-        `OpenOptions conflict: ${field}=${JSON.stringify(opts[field])} ` +
+        `OpenOptions conflict: ${field}=${JSON.stringify((opts as Record<string, unknown>)[field])} ` +
         `conflicts with another typed option setting "${key}"="${out.get(key)}"`
       );
     }
@@ -574,7 +770,7 @@ function normalizeOpenOptions(opts) {
       if (typeof rawKey !== 'string' || rawKey.length === 0) {
         throw new DuckDBError(`OpenOptions.config key must be a non-empty string`);
       }
-      let rendered;
+      let rendered: string;
       if (typeof rawVal === 'boolean')      rendered = rawVal ? 'true' : 'false';
       else if (typeof rawVal === 'number')  rendered = String(rawVal);
       else if (typeof rawVal === 'bigint')  rendered = rawVal.toString();
@@ -606,7 +802,7 @@ function normalizeOpenOptions(opts) {
 const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /** Throws if name isn't a simple identifier (letter/underscore start, then word chars). */
-function assertSimpleIdentifier(name, label = 'identifier') {
+function assertSimpleIdentifier(name: string, label = 'identifier'): string {
   if (typeof name !== 'string' || !IDENT_RE.test(name)) {
     throw new DuckDBError(`Invalid ${label}: ${JSON.stringify(name)}`);
   }
@@ -632,8 +828,8 @@ function assertSimpleIdentifier(name, label = 'identifier') {
 // nonzero for every awaited method.
 // ==============================================================================
 
-function makeTxnHandle(conn, scope) {
-  function assertActive(label) {
+function makeTxnHandle(conn: Connection, scope: { closed: boolean }): TxnHandle {
+  function assertActive(label: string) {
     if (scope.closed) {
       throw new DuckDBTransactionError(
         `Cannot ${label}(): the transaction callback has already ` +
@@ -642,26 +838,26 @@ function makeTxnHandle(conn, scope) {
     }
   }
   return {
-    async query(sql, params)   { assertActive('query');   return conn.query(sql, params); },
-    async all(sql, params)     { assertActive('all');     return conn.all(sql, params); },
-    async get(sql, params)     { assertActive('get');     return conn.get(sql, params); },
-    async run(sql, params)     { assertActive('run');     return conn.run(sql, params); },
-    async exec(sql)            { assertActive('exec');    return conn.exec(sql); },
-    async prepare(sql)         { assertActive('prepare'); return conn.prepare(sql); },
-    iterate(sql, params)       { assertActive('iterate'); return conn.iterate(sql, params); },
-    chunks(sql, params)        { assertActive('chunks');  return conn.chunks(sql, params); },
-    async pragma(name, value)  {
+    async query(sql: string, params?: Params)   { assertActive('query');   return conn.query(sql, params); },
+    async all(sql: string, params?: Params)     { assertActive('all');     return conn.all(sql, params); },
+    async get(sql: string, params?: Params)     { assertActive('get');     return conn.get(sql, params); },
+    async run(sql: string, params?: Params)     { assertActive('run');     return conn.run(sql, params); },
+    async exec(sql: string)            { assertActive('exec');    return conn.exec(sql); },
+    async prepare(sql: string)         { assertActive('prepare'); return conn.prepare(sql); },
+    iterate(sql: string, params?: Params)       { assertActive('iterate'); return conn.iterate(sql, params); },
+    chunks(sql: string, params?: Params)        { assertActive('chunks');  return conn.chunks(sql, params); },
+    async pragma(name: string, value?: string | number | boolean | bigint | null)  {
       assertActive('pragma');
       if (arguments.length < 2) return conn.pragma(name);
       return conn.pragma(name, value);
     },
-    async installExtension(n)  { assertActive('installExtension'); return conn.installExtension(n); },
-    async loadExtension(n)     { assertActive('loadExtension');    return conn.loadExtension(n); },
-    async checkpoint(opts)     { assertActive('checkpoint');       return conn.checkpoint(opts); },
-    async append(table, cols, rows) {
+    async installExtension(n: string)  { assertActive('installExtension'); return conn.installExtension(n); },
+    async loadExtension(n: string)     { assertActive('loadExtension');    return conn.loadExtension(n); },
+    async checkpoint(opts?: CheckpointOptions)     { assertActive('checkpoint');       return conn.checkpoint(opts); },
+    async append(table: string, cols: string[], rows: unknown[][]) {
       assertActive('append'); return conn.append(table, cols, rows);
     },
-    async executeBatchPrepared(sql, paramSets) {
+    async executeBatchPrepared(sql: string, paramSets: unknown[][]) {
       assertActive('executeBatchPrepared'); return conn.executeBatchPrepared(sql, paramSets);
     },
     // Nested transactions: throw with the upstream-blocker message
@@ -670,18 +866,21 @@ function makeTxnHandle(conn, scope) {
     // typings remain stable. Per GPT-5.5: "remove from the public
     // type but keep runtime throwing if accessed? I would not do
     // that. Keep docs/types/runtime aligned."
-    async transaction(_fn) {
+    async transaction(_fn: (tx: TxnHandle) => Promise<unknown>): Promise<never> {
       throw new DuckDBTransactionError(
         'Nested transactions are not supported because DuckDB v1.5.2 ' +
         'does not currently parse SAVEPOINT. This will be revisited ' +
         'when upstream DuckDB adds SAVEPOINT support.',
       );
     },
-  };
+    // Cast: the object literal's methods are non-generic implementations
+    // of TxnHandle's generic signatures (they delegate straight to the
+    // Connection); the cast bridges that variance gap.
+  } as TxnHandle;
 }
 
 /** Render a JS scalar as a SQL literal. Supports string/number/boolean/null/undefined. */
-function quoteSqlLiteral(value) {
+function quoteSqlLiteral(value: unknown): string {
   if (value === null || value === undefined) return 'NULL';
   if (typeof value === 'boolean') return value ? 'TRUE' : 'FALSE';
   if (typeof value === 'number') {
@@ -699,7 +898,7 @@ function quoteSqlLiteral(value) {
 }
 
 // Format a hugeint (16 bytes: lower uint64 at offset 0, upper int64 at offset 8) as UUID
-function readUUID(dataPtr, row) {
+function readUUID(dataPtr: number, row: number): string | null {
   if (!dataPtr) return null;
   const offset = row * 16;
   const lower = ffiRead.u64(dataPtr, offset);
@@ -720,12 +919,73 @@ function readUUID(dataPtr, row) {
 // ==============================================================================
 
 class Database {
-  #ptrBuf = null;
-  #handle = null;
-  #state = 'open';        // 'open' | 'closing' | 'closed'
-  #closePromise = null;
+  #ptrBuf: Uint8Array | null = null;
+  #handle: bigint | null = null;
+  #state: 'open' | 'closing' | 'closed' = 'open';        // 'open' | 'closing' | 'closed'
+  #closePromise: Promise<void> | null = null;
 
-  constructor(path, opts = undefined) {
+  // --- v0.2 shortcuts (delegate to a lazy implicit Connection) ---
+  //
+  // Attached to Database.prototype below the class body (see the
+  // "Database extensions" section — the implementations reference
+  // Connection, which is defined after Database in this file). The
+  // `declare` properties here carry their public types without
+  // emitting any runtime fields.
+
+  /** Execute a query. Returns full QueryResult (rows + columns + rowsChanged). */
+  declare query: <T extends Row = Row>(sql: string, params?: Params) => Promise<QueryResult<T>>;
+
+  /** Alias of query(). */
+  declare all: <T extends Row = Row>(sql: string, params?: Params) => Promise<QueryResult<T>>;
+
+  /** Execute and return the first row, or undefined if no rows. */
+  declare get: <T extends Row = Row>(sql: string, params?: Params) => Promise<T | undefined>;
+
+  /** Execute for side effects. Returns rowsChanged for INSERT/UPDATE/DELETE. */
+  declare run: (sql: string, params?: Params) => Promise<RunResult>;
+
+  /** Fire-and-forget multi-statement execution. No params, no rows returned. */
+  declare exec: (sql: string) => Promise<void>;
+
+  /** Prepare a statement for repeated execution. Caller must close() the Statement. */
+  declare prepare: <T extends Row = Row>(sql: string) => Promise<Statement<T>>;
+
+  /**
+   * Stream rows from an SQL query. Sugar around prepare(sql).iterate(params)
+   * that owns the temporary Statement's lifecycle. Prepares LAZILY on first
+   * `.next()`, so abandoning the iterator allocates no FFI resources.
+   * (v0.3+)
+   */
+  declare iterate: <T extends Row = Row>(sql: string, params?: Params) => AsyncIterableIterator<T>;
+
+  /**
+   * Run fn() inside a transaction. BEGIN before, COMMIT after success,
+   * ROLLBACK + rethrow on any throw. fn receives a `TxnHandle` (v0.5+)
+   * — a scoped proxy with the same shortcut methods as Connection, but
+   * marked closed after the callback so out-of-scope use throws.
+   *
+   * Nested transactions throw `DuckDBTransactionError`: DuckDB v1.5.2
+   * doesn't parse SAVEPOINT. Reserved for forward-compat when upstream
+   * lands savepoint support.
+   */
+  declare transaction: <R>(fn: (tx: TxnHandle) => Promise<R>) => Promise<R>;
+
+  /** Run `PRAGMA name` (get) or `PRAGMA name=value` (set). Returns the first row, or undefined. (v0.5+) */
+  declare pragma: (name: string, value?: string | number | boolean | bigint | null) => Promise<Row | undefined>;
+
+  /** `INSTALL <name>` with strict identifier validation. (v0.5+) */
+  declare installExtension: (name: string) => Promise<void>;
+
+  /** `LOAD <name>` with strict identifier validation. (v0.5+) */
+  declare loadExtension: (name: string) => Promise<void>;
+
+  /** Flush the WAL via `CHECKPOINT` (or `FORCE CHECKPOINT`). (v0.5.1+) */
+  declare checkpoint: (opts?: CheckpointOptions) => Promise<void>;
+
+  /** Stream rows chunk-by-chunk (DuckDB vector ≈ 2048 rows per chunk). (v0.5+) */
+  declare chunks: <T extends Row = Row>(sql: string, params?: Params) => AsyncIterableIterator<RowChunk<T>>;
+
+  constructor(path: string, opts: OpenOptions | undefined = undefined) {
     this.#ptrBuf = allocPtr();
     const pathBytes = path && path !== ':memory:' ? toCString(path) : null;
     const pathArg = pathBytes ? ptr(pathBytes) : null;
@@ -768,12 +1028,14 @@ class Database {
     this.#handle = readHandle(this.#ptrBuf);
   }
 
-  get handle() { return this.#handle; }
-  get ptrBuf() { return this.#ptrBuf; }
-  get _state() { return this.#state; }
-  _isOpen() { return this.#state === 'open'; }
+  /** Internal: BigInt handle to the underlying duckdb_database. */
+  get handle(): bigint | null { return this.#handle; }
+  get ptrBuf(): Uint8Array | null { return this.#ptrBuf; }
+  get _state(): 'open' | 'closing' | 'closed' { return this.#state; }
+  _isOpen(): boolean { return this.#state === 'open'; }
 
-  connect() {
+  /** Open a connection. Each connection is independent and can be used in parallel. */
+  connect(): Connection {
     if (this.#state !== 'open') throw new DuckDBClosedError('Database');
     return new Connection(this);
   }
@@ -788,7 +1050,7 @@ class Database {
   // promise. Symbol.dispose calls this fire-and-forget with .catch();
   // Symbol.asyncDispose awaits it. Streaming users should prefer
   // `await using db = open(...)`.
-  async close() {
+  async close(): Promise<void> {
     if (this.#closePromise) return this.#closePromise;
     if (this.#state === 'closed') return;
     this.#state = 'closing';
@@ -801,11 +1063,12 @@ class Database {
 
     // Detach the lazy implicit Connection so it can be closed in the
     // async tail; the slot is wired below (Object.defineProperty), so we
-    // read it through `this[DEFAULT_CONN]` lazily here.
+    // read it through `this[DEFAULT_CONN]` lazily here. (`as any`: the
+    // Symbol-keyed slot is deliberately not part of the class shape.)
     this.#closePromise = (async () => {
-      const defaultConn = this[DEFAULT_CONN];
+      const defaultConn: Connection | null | undefined = (this as any)[DEFAULT_CONN];
       if (defaultConn) {
-        this[DEFAULT_CONN] = null;
+        (this as any)[DEFAULT_CONN] = null;
         try { await defaultConn.close(); } catch { /* swallow */ }
       }
       if (ptrBuf) {
@@ -825,42 +1088,43 @@ class Database {
 // ==============================================================================
 
 class Connection {
-  #ptrBuf = null;
-  #handle = null;
-  #db = null;
-  #state = 'open';           // 'open' | 'closing' | 'closed'
+  #ptrBuf: Uint8Array | null = null;
+  #handle: bigint | null = null;
+  #db: Database | null = null;
+  #state: 'open' | 'closing' | 'closed' = 'open';           // 'open' | 'closing' | 'closed'
   #mutex = new AsyncMutex();
-  #closePromise = null;
-  #activeIterator = null;    // wrapper for the in-flight Statement.iterate(), if any
-  #statements = new Set();
+  #closePromise: Promise<void> | null = null;
+  #activeIterator: ActiveIterator | null = null;    // wrapper for the in-flight Statement.iterate(), if any
+  #statements = new Set<Statement<any>>();
 
-  constructor(db) {
+  constructor(db: Database) {
     this.#db = db;
     this.#ptrBuf = allocPtr();
-    const result = lib.duckdb_connect(db.handle, ptr(this.#ptrBuf));
+    const result = lib.duckdb_connect(db.handle!, ptr(this.#ptrBuf));
     if (result !== 0) throw new Error('Failed to create connection');
     this.#handle = readHandle(this.#ptrBuf);
   }
 
-  get handle() { return this.#handle; }
-  get ptrBuf() { return this.#ptrBuf; }
-  get _state() { return this.#state; }
-  _isOpen() { return this.#state === 'open'; }
+  /** Internal: BigInt handle to the underlying duckdb_connection. */
+  get handle(): bigint | null { return this.#handle; }
+  get ptrBuf(): Uint8Array | null { return this.#ptrBuf; }
+  get _state(): 'open' | 'closing' | 'closed' { return this.#state; }
+  _isOpen(): boolean { return this.#state === 'open'; }
 
   // Lock primitives. Per-Connection (replaces process-global lock).
-  withLock(fn) { return this.#mutex.withLock(fn); }
-  acquireLock() { return this.#mutex.acquire(); }
+  withLock<T>(fn: () => T): Promise<T> { return this.#mutex.withLock(fn); }
+  acquireLock(): Promise<() => void> { return this.#mutex.acquire(); }
 
   // Track outstanding Statements so close() can free their prepared handles
   // before disconnect. A leaked Statement after Connection.close() would
   // either crash on next use or quietly leak the prepared handle in DuckDB.
-  _trackStatement(stmt) { this.#statements?.add(stmt); }
-  _untrackStatement(stmt) { this.#statements?.delete(stmt); }
+  _trackStatement(stmt: Statement<any>) { this.#statements?.add(stmt); }
+  _untrackStatement(stmt: Statement<any>) { this.#statements?.delete(stmt); }
 
   // Statement.iterate() registers/unregisters here so Connection.close() can
   // cancel the in-flight iterator before destroying its own handle.
-  _setActiveIterator(it) { this.#activeIterator = it; }
-  _clearActiveIterator(it) {
+  _setActiveIterator(it: ActiveIterator) { this.#activeIterator = it; }
+  _clearActiveIterator(it: ActiveIterator) {
     if (this.#activeIterator === it) this.#activeIterator = null;
   }
 
@@ -870,25 +1134,25 @@ class Connection {
    * @param {any[]} params - Optional parameters for prepared statement
    * @returns {Promise<object[]>} Array of row objects
    */
-  query(sql, params = []) {
+  query<T extends Row = Row>(sql: string, params: Params = []): Promise<QueryResult<T>> {
     return this.withLock(() => {
       // Closed-state check INSIDE the lock — close() may have flipped the
       // state while this call was waiting in the mutex queue.
       if (this.#state !== 'open') throw new DuckDBClosedError('Connection');
       if (params.length > 0) return this.#queryPrepared(sql, params);
       return this.#querySimple(sql);
-    });
+    }) as Promise<QueryResult<T>>;
   }
 
-  #querySimple(sql) {
+  #querySimple(sql: string): QueryResult {
     const resultPtr = new Uint8Array(64);  // duckdb_result struct is ~48 bytes
     const sqlBytes = toCString(sql);
-    const status = lib.duckdb_query(this.#handle, ptr(sqlBytes), ptr(resultPtr));
+    const status = lib.duckdb_query(this.#handle!, ptr(sqlBytes), ptr(resultPtr));
 
     const rp = ptr(resultPtr);
     if (status !== 0) {
       const errorPtr = lib.duckdb_result_error(rp);
-      const error = errorPtr ? fromCString(errorPtr) : 'Query failed';
+      const error = errorPtr ? fromCString(errorPtr)! : 'Query failed';
       lib.duckdb_destroy_result(rp);
       throw new Error(error);
     }
@@ -913,16 +1177,16 @@ class Connection {
     }
   }
 
-  #queryPrepared(sql, params) {
+  #queryPrepared(sql: string, params: Params): QueryResult {
     const stmtPtr = allocPtr();
     const sqlBytes = toCString(sql);
 
-    const prepStatus = lib.duckdb_prepare(this.#handle, ptr(sqlBytes), ptr(stmtPtr));
+    const prepStatus = lib.duckdb_prepare(this.#handle!, ptr(sqlBytes), ptr(stmtPtr));
     if (prepStatus !== 0) {
       const stmtHandle = readHandle(stmtPtr);
       if (stmtHandle) {
         const errPtr = lib.duckdb_prepare_error(stmtHandle);
-        const errMsg = errPtr ? fromCString(errPtr) : 'Failed to prepare statement';
+        const errMsg = errPtr ? fromCString(errPtr)! : 'Failed to prepare statement';
         lib.duckdb_destroy_prepare(ptr(stmtPtr));
         throw new DuckDBPrepareError(errMsg);
       }
@@ -951,7 +1215,7 @@ class Connection {
    * @param {any[]} params      - JS values to bind
    * @returns {Array & { columns, rowsChanged }}
    */
-  _executePreparedSync(stmtHandle, params) {
+  _executePreparedSync(stmtHandle: bigint, params: Params): QueryResult {
     if (params && params.length > 0) {
       // Statement is reused; clear previous bindings to avoid leakage.
       lib.duckdb_clear_bindings(stmtHandle);
@@ -968,7 +1232,7 @@ class Connection {
     // execution-time failures vs. parse errors).
     const errorPtr = lib.duckdb_result_error(rp);
     if (execStatus !== 0 || errorPtr) {
-      const error = errorPtr ? fromCString(errorPtr) : 'Prepared execution failed';
+      const error = errorPtr ? fromCString(errorPtr)! : 'Prepared execution failed';
       lib.duckdb_destroy_result(rp);
       throw new DuckDBError(error);
     }
@@ -1019,15 +1283,15 @@ class Connection {
 
   // Decode the column metadata for a result. Pure data, no row decoding.
   // Shared by the materializing extract path and the streaming iterate path.
-  _decodeColumnsMetadata(resultPtr) {
+  _decodeColumnsMetadata(resultPtr: Uint8Array): InternalColumnInfo[] {
     const rp = ptr(resultPtr);
     const colCount = Number(lib.duckdb_column_count(rp));
 
-    const columns = [];
+    const columns: InternalColumnInfo[] = [];
     for (let c = 0; c < colCount; c++) {
       const namePtr = lib.duckdb_column_name(rp, BigInt(c));
       const type = lib.duckdb_column_type(rp, BigInt(c));
-      const col = {
+      const col: InternalColumnInfo = {
         name: fromCString(namePtr) || `col${c}`,
         type,
         typeName: this._typeName(type)
@@ -1121,13 +1385,13 @@ class Connection {
 
   // Decode all rows from a single chunk into an array of row objects.
   // Caller is responsible for destroying the chunk after this returns.
-  _decodeChunkRows(chunk, columns) {
+  _decodeChunkRows(chunk: bigint, columns: InternalColumnInfo[]): Row[] & { columns?: ColumnInfo[] } {
     const chunkSize = Number(lib.duckdb_data_chunk_get_size(chunk));
     if (chunkSize === 0) return [];
 
-    const colVec = [];
-    const colData = [];
-    const colValidity = [];
+    const colVec: bigint[] = [];
+    const colData: number[] = [];
+    const colValidity: number[] = [];
     for (let c = 0; c < columns.length; c++) {
       const vec = lib.duckdb_data_chunk_get_vector(chunk, BigInt(c));
       colVec.push(vec);
@@ -1137,13 +1401,13 @@ class Connection {
       colValidity.push(Number(vp));
     }
 
-    const rows = new Array(chunkSize);
+    const rows: Row[] = new Array(chunkSize);
     for (let r = 0; r < chunkSize; r++) {
-      const row = {};
+      const row: Row = {};
       for (let c = 0; c < columns.length; c++) {
-        const col = columns[c];
-        row[col.name] = isValid(colValidity[c], r)
-          ? this._readValue(colData[c], r, col.type, col, colVec[c])
+        const col = columns[c]!;
+        row[col.name] = isValid(colValidity[c]!, r)
+          ? this._readValue(colData[c]!, r, col.type, col, colVec[c]!)
           : null;
       }
       rows[r] = row;
@@ -1155,11 +1419,11 @@ class Connection {
   // path (where the caller wants the whole result as an array). The
   // streaming path (Statement.iterate) uses the same column decode + row
   // decode helpers but yields rows one at a time.
-  #extractChunks(resultPtr) {
+  #extractChunks(resultPtr: Uint8Array): QueryResult {
     const rp = ptr(resultPtr);
     const columns = this._decodeColumnsMetadata(resultPtr);
 
-    const rows = [];
+    const rows: Row[] = [];
     const chunkBuf = allocPtr();
 
     while (true) {
@@ -1175,8 +1439,10 @@ class Connection {
       }
     }
 
-    rows.columns = columns;
-    return rows;
+    // Cast: rowsChanged is attached by the callers (#querySimple /
+    // _executePreparedSync) immediately after this returns.
+    (rows as QueryResult).columns = columns;
+    return rows as QueryResult;
   }
 
   // ---------------------------------------------------------------------------
@@ -1187,7 +1453,7 @@ class Connection {
 
   // col = column metadata (includes decimalScale, enumDict, etc.)
   // vec = vector handle (for nested type child access)
-  _readValue(dataPtr, row, type, col, vec) {
+  _readValue(dataPtr: number, row: number, type: number, col: InternalColumnInfo | null, vec: bigint): unknown {
     switch (type) {
       case DUCKDB_TYPE.BOOLEAN:
         return ffiRead.u8(dataPtr, row) !== 0;
@@ -1233,7 +1499,7 @@ class Connection {
         // Read based on internal type, divide by 10^scale, return as string
         const scale = col?.decimalScale || 0;
         const internalType = col?.decimalInternalType || DUCKDB_TYPE.DOUBLE;
-        let raw;
+        let raw: bigint;
         switch (internalType) {
           case DUCKDB_TYPE.SMALLINT:
             raw = BigInt(ffiRead.i16(dataPtr, row * 2)); break;
@@ -1351,7 +1617,7 @@ class Connection {
         const dict = col?.enumDict;
         if (!dict) return null;
         const enumType = col?.enumInternalType || DUCKDB_TYPE.UTINYINT;
-        let idx;
+        let idx: number;
         switch (enumType) {
           case DUCKDB_TYPE.UTINYINT:  idx = ffiRead.u8(dataPtr, row); break;
           case DUCKDB_TYPE.USMALLINT: idx = ffiRead.u16(dataPtr, row * 2); break;
@@ -1384,10 +1650,10 @@ class Connection {
 
       case DUCKDB_TYPE.STRUCT: {
         if (!vec) return null;
-        const obj = {};
+        const obj: Row = {};
         const childCount = col?.structChildren?.length || 0;
         for (let i = 0; i < childCount; i++) {
-          const child = col.structChildren[i];
+          const child = col!.structChildren![i]!;
           const childVec = lib.duckdb_struct_vector_get_child(vec, BigInt(i));
           const childData = Number(lib.duckdb_vector_get_data(childVec));
           const childValidity = Number(lib.duckdb_vector_get_validity(childVec));
@@ -1414,7 +1680,7 @@ class Connection {
         const valValidity = Number(lib.duckdb_vector_get_validity(valVec));
         const keyType = col?.keyType || DUCKDB_TYPE.VARCHAR;
         const valType = col?.valueType || DUCKDB_TYPE.VARCHAR;
-        const obj = {};
+        const obj: Row = {};
         for (let i = 0; i < listLength; i++) {
           const childRow = listOffset + i;
           const k = isValid(keyValidity, childRow)
@@ -1456,14 +1722,14 @@ class Connection {
     }
   }
 
-  _typeName(type) {
+  _typeName(type: number): string {
     for (const [name, value] of Object.entries(DUCKDB_TYPE)) {
       if (value === type) return name;
     }
     return 'UNKNOWN';
   }
 
-  _bindParams(stmtHandle, params) {
+  _bindParams(stmtHandle: bigint, params: Params) {
     for (let i = 0; i < params.length; i++) {
       const paramIdx = BigInt(i + 1);
       const value = params[i];
@@ -1495,7 +1761,7 @@ class Connection {
     }
   }
 
-  #appendValue(appenderHandle, value) {
+  #appendValue(appenderHandle: bigint, value: unknown) {
     if (value === null || value === undefined) {
       lib.duckdb_append_null(appenderHandle);
     } else if (typeof value === 'boolean') {
@@ -1529,18 +1795,18 @@ class Connection {
    * @param {any[][]} rows - Array of value arrays (positional, matching columns)
    * @returns {Promise<{rows: number}>}
    */
-  append(table, columns, rows) {
+  append(table: string, columns: string[], rows: unknown[][]): Promise<AppendResult> {
     return this.withLock(() => {
       if (this.#state !== 'open') throw new DuckDBClosedError('Connection');
       const appenderPtr = allocPtr();
       const tableBytes = toCString(table);
 
-      const status = lib.duckdb_appender_create(this.#handle, null, ptr(tableBytes), ptr(appenderPtr));
+      const status = lib.duckdb_appender_create(this.#handle!, null, ptr(tableBytes), ptr(appenderPtr));
       if (status !== 0) {
         const handle = readHandle(appenderPtr);
         if (handle) {
           const errPtr = lib.duckdb_appender_error(handle);
-          const errMsg = errPtr ? fromCString(errPtr) : 'Failed to create appender';
+          const errMsg = errPtr ? fromCString(errPtr)! : 'Failed to create appender';
           lib.duckdb_appender_destroy(ptr(appenderPtr));
           throw new Error(errMsg);
         }
@@ -1557,7 +1823,7 @@ class Connection {
             const addStatus = lib.duckdb_appender_add_column(appenderHandle, ptr(colBytes));
             if (addStatus !== 0) {
               const errPtr = lib.duckdb_appender_error(appenderHandle);
-              throw new Error(errPtr ? fromCString(errPtr) : `Failed to add column: ${col}`);
+              throw new Error(errPtr ? fromCString(errPtr)! : `Failed to add column: ${col}`);
             }
           }
         }
@@ -1572,7 +1838,7 @@ class Connection {
         const flushStatus = lib.duckdb_appender_flush(appenderHandle);
         if (flushStatus !== 0) {
           const errPtr = lib.duckdb_appender_error(appenderHandle);
-          const errMsg = errPtr ? fromCString(errPtr) : 'Appender flush failed';
+          const errMsg = errPtr ? fromCString(errPtr)! : 'Appender flush failed';
           throw new Error(errMsg);
         }
 
@@ -1596,18 +1862,18 @@ class Connection {
    * @param {any[][]} paramSets - Array of param arrays, one per execution
    * @returns {Promise<{rows: number}>}
    */
-  executeBatchPrepared(sql, paramSets) {
+  executeBatchPrepared(sql: string, paramSets: unknown[][]): Promise<AppendResult> {
     return this.withLock(() => {
       if (this.#state !== 'open') throw new DuckDBClosedError('Connection');
       const stmtPtr = allocPtr();
       const sqlBytes = toCString(sql);
 
-      const prepStatus = lib.duckdb_prepare(this.#handle, ptr(sqlBytes), ptr(stmtPtr));
+      const prepStatus = lib.duckdb_prepare(this.#handle!, ptr(sqlBytes), ptr(stmtPtr));
       if (prepStatus !== 0) {
         const stmtHandle = readHandle(stmtPtr);
         if (stmtHandle) {
           const errPtr = lib.duckdb_prepare_error(stmtHandle);
-          const errMsg = errPtr ? fromCString(errPtr) : 'Failed to prepare statement';
+          const errMsg = errPtr ? fromCString(errPtr)! : 'Failed to prepare statement';
           lib.duckdb_destroy_prepare(ptr(stmtPtr));
           throw new Error(errMsg);
         }
@@ -1627,7 +1893,7 @@ class Connection {
           const rp = ptr(resultPtr);
           const errorPtr = lib.duckdb_result_error(rp);
           if (errorPtr) {
-            const error = fromCString(errorPtr);
+            const error = fromCString(errorPtr)!;
             lib.duckdb_destroy_result(rp);
             throw new Error(error);
           }
@@ -1651,7 +1917,7 @@ class Connection {
    * This alias is retained so any pre-existing callers keep working; new
    * code should prefer executeBatchPrepared.
    */
-  queryBatch(sql, paramSets) {
+  queryBatch(sql: string, paramSets: unknown[][]): Promise<AppendResult> {
     return this.executeBatchPrepared(sql, paramSets);
   }
 
@@ -1668,10 +1934,10 @@ class Connection {
    *
    * Throws on FFI lifecycle failures (also fail-closed).
    */
-  countStatements(sql) {
+  countStatements(sql: string): number {
     const handlePtr = allocPtr();
     const sqlBytes = toCString(sql);
-    const count = lib.duckdb_extract_statements(this.#handle, ptr(sqlBytes), ptr(handlePtr));
+    const count = lib.duckdb_extract_statements(this.#handle!, ptr(sqlBytes), ptr(handlePtr));
     // Always free the handle, even when count == 0. Surface the parser's
     // error message via duckdb_extract_statements_error if the caller asks
     // (it's stored on the extracted-statements handle).
@@ -1704,24 +1970,24 @@ class Connection {
   // ===========================================================================
 
   /** Alias for query(). Returns the full QueryResult. */
-  all(sql, params) {
-    return this.query(sql, params);
+  all<T extends Row = Row>(sql: string, params?: Params): Promise<QueryResult<T>> {
+    return this.query<T>(sql, params);
   }
 
   /** Returns the first row, or undefined if no rows. */
-  async get(sql, params) {
-    const rows = await this.query(sql, params);
+  async get<T extends Row = Row>(sql: string, params?: Params): Promise<T | undefined> {
+    const rows = await this.query<T>(sql, params);
     return rows.length > 0 ? rows[0] : undefined;
   }
 
   /** Executes sql for its side effects. Returns { rowsChanged }. */
-  async run(sql, params) {
+  async run(sql: string, params?: Params): Promise<RunResult> {
     const rows = await this.query(sql, params);
     return { rowsChanged: rows.rowsChanged };
   }
 
   /** Fire-and-forget multi-statement execution. No params, no rows returned. */
-  async exec(sql) {
+  async exec(sql: string): Promise<void> {
     await this.query(sql);
   }
 
@@ -1754,7 +2020,7 @@ class Connection {
    * @param {string|number|boolean|bigint|null|undefined} [value]
    * @returns {Promise<object|undefined>} first row, or undefined
    */
-  async pragma(name, value) {
+  async pragma(name: string, value?: string | number | boolean | bigint | null): Promise<Row | undefined> {
     assertSimpleIdentifier(name, 'PRAGMA name');
     let sql;
     if (arguments.length < 2) {
@@ -1772,7 +2038,7 @@ class Connection {
    *
    * @param {string} name - extension name (must match identifier regex)
    */
-  async installExtension(name) {
+  async installExtension(name: string): Promise<void> {
     assertSimpleIdentifier(name, 'extension name');
     await this.exec(`INSTALL ${name}`);
   }
@@ -1784,7 +2050,7 @@ class Connection {
    *
    * @param {string} name - extension name
    */
-  async loadExtension(name) {
+  async loadExtension(name: string): Promise<void> {
     assertSimpleIdentifier(name, 'extension name');
     await this.exec(`LOAD ${name}`);
   }
@@ -1806,7 +2072,7 @@ class Connection {
    *   Strictly validated as an identifier (no SQL injection).
    * @returns {Promise<void>}
    */
-  async checkpoint(opts = {}) {
+  async checkpoint(opts: CheckpointOptions = {}): Promise<void> {
     const force = opts && opts.force === true;
     let sql = force ? 'FORCE CHECKPOINT' : 'CHECKPOINT';
     if (opts && opts.database !== undefined) {
@@ -1829,7 +2095,7 @@ class Connection {
    * @param {any[]} params
    * @returns {AsyncIterableIterator<object>}
    */
-  iterate(sql, params = []) {
+  iterate<T extends Row = Row>(sql: string, params: Params = []): AsyncIterableIterator<T> {
     if (this.#state !== 'open') throw new DuckDBClosedError('Connection');
     const conn = this;
     return (async function* () {
@@ -1839,7 +2105,7 @@ class Connection {
       } finally {
         try { await stmt.close(); } catch { /* swallow */ }
       }
-    })();
+    })() as AsyncIterableIterator<T>;
   }
 
   /**
@@ -1855,7 +2121,7 @@ class Connection {
    * @param {any[]} params
    * @returns {AsyncIterableIterator<{rows: object[], chunkIndex: number, rowOffset: number}>}
    */
-  chunks(sql, params = []) {
+  chunks<T extends Row = Row>(sql: string, params: Params = []): AsyncIterableIterator<RowChunk<T>> {
     if (this.#state !== 'open') throw new DuckDBClosedError('Connection');
     const conn = this;
     return (async function* () {
@@ -1865,7 +2131,7 @@ class Connection {
       } finally {
         try { await stmt.close(); } catch { /* swallow */ }
       }
-    })();
+    })() as AsyncIterableIterator<RowChunk<T>>;
   }
 
   /**
@@ -1878,25 +2144,25 @@ class Connection {
    *
    * @returns {Promise<Statement>}
    */
-  async prepare(sql) {
+  async prepare<T extends Row = Row>(sql: string): Promise<Statement<T>> {
     if (this.#state !== 'open') throw new DuckDBClosedError('Connection');
     return this.withLock(() => {
       if (this.#state !== 'open') throw new DuckDBClosedError('Connection');
       const stmtPtr = allocPtr();
       const sqlBytes = toCString(sql);
-      const status = lib.duckdb_prepare(this.#handle, ptr(sqlBytes), ptr(stmtPtr));
+      const status = lib.duckdb_prepare(this.#handle!, ptr(sqlBytes), ptr(stmtPtr));
       if (status !== 0) {
         const stmtHandle = readHandle(stmtPtr);
         if (stmtHandle) {
           const errPtr = lib.duckdb_prepare_error(stmtHandle);
-          const msg = errPtr ? fromCString(errPtr) : 'Failed to prepare statement';
+          const msg = errPtr ? fromCString(errPtr)! : 'Failed to prepare statement';
           lib.duckdb_destroy_prepare(ptr(stmtPtr));
           throw new DuckDBPrepareError(msg);
         }
         throw new DuckDBPrepareError('Failed to prepare statement');
       }
       const stmtHandle = readHandle(stmtPtr);
-      return new Statement(this, stmtHandle, stmtPtr);
+      return new Statement<T>(this, stmtHandle, stmtPtr);
     });
   }
 
@@ -1928,7 +2194,7 @@ class Connection {
    * @param {(tx: TxnHandle) => Promise<R>} fn
    * @returns {Promise<R>}
    */
-  async transaction(fn) {
+  async transaction<R>(fn: (tx: TxnHandle) => Promise<R>): Promise<R> {
     if (this.#inTransaction) {
       throw new DuckDBTransactionError(
         'Nested transactions are not supported because DuckDB v1.5.2 ' +
@@ -1973,7 +2239,7 @@ class Connection {
   // awaiting.
   //
   // Idempotent via #closePromise.
-  async close() {
+  async close(): Promise<void> {
     if (this.#closePromise) return this.#closePromise;
     if (this.#state === 'closed') return;
     this.#state = 'closing';
@@ -1991,7 +2257,7 @@ class Connection {
     // immediately so the v0.2-era contract `conn.close(); stmt.closed
     // === true` still holds with the sync getter. Capture the promises
     // to await in the async tail before we destroy the connection.
-    const stmtPromises = [];
+    const stmtPromises: Promise<void>[] = [];
     for (const stmt of this.#statements) {
       stmtPromises.push(stmt.close().catch(() => { /* swallow */ }));
     }
@@ -2039,15 +2305,15 @@ class Connection {
 // the closure that wraps it, so it doesn't get GC'd while statements live.
 // ==============================================================================
 
-class Statement {
-  #conn = null;
-  #handle = null;
-  #stmtPtr = null;
-  #state = 'open';           // 'open' | 'closing' | 'closed'
-  #closePromise = null;
-  #activeIterator = null;    // wrapper for in-flight iterate(), if any
+class Statement<T extends Row = Row> {
+  #conn: Connection | null = null;
+  #handle: bigint | null = null;
+  #stmtPtr: Uint8Array | null = null;
+  #state: 'open' | 'closing' | 'closed' = 'open';           // 'open' | 'closing' | 'closed'
+  #closePromise: Promise<void> | null = null;
+  #activeIterator: ActiveIterator<any> | null = null;    // wrapper for in-flight iterate(), if any
 
-  constructor(conn, handle, stmtPtr) {
+  constructor(conn: Connection, handle: bigint, stmtPtr: Uint8Array) {
     this.#conn = conn;
     this.#handle = handle;
     this.#stmtPtr = stmtPtr;
@@ -2057,8 +2323,9 @@ class Statement {
   // .closed is read synchronously by tests immediately after .close().
   // It must flip to true the moment close() is called, even though the
   // FFI destroy happens in the async tail.
-  get closed() { return this.#state !== 'open'; }
-  get _state() { return this.#state; }
+  /** True after close(). Subsequent calls throw DuckDBClosedError. */
+  get closed(): boolean { return this.#state !== 'open'; }
+  get _state(): 'open' | 'closing' | 'closed' { return this.#state; }
 
   /**
    * Execute and return all rows as QueryResult.
@@ -2066,7 +2333,7 @@ class Statement {
    * `async function` so the closed-state checks throw via Promise rejection
    * (matching what users expect from `await stmt.all(...)`).
    */
-  async all(params = []) {
+  async all(params: Params = []): Promise<QueryResult<T>> {
     if (this.#state !== 'open') throw new DuckDBClosedError('Statement');
     if (!this.#conn || !this.#conn._isOpen()) {
       throw new DuckDBClosedError('Connection (statement\'s owning connection)');
@@ -2074,7 +2341,7 @@ class Statement {
     if (this.#activeIterator) {
       throw new DuckDBError('Statement is iterating; consume or close the iterator first');
     }
-    const handle = this.#handle;
+    const handle = this.#handle!;
     const conn = this.#conn;
     return conn.withLock(() => {
       // Recheck inside the lock — both close() and conn.close() can have
@@ -2083,17 +2350,17 @@ class Statement {
         throw new DuckDBClosedError('Statement');
       }
       return conn._executePreparedSync(handle, params);
-    });
+    }) as Promise<QueryResult<T>>;
   }
 
   /** Execute and return first row, or undefined. */
-  async get(params = []) {
+  async get(params: Params = []): Promise<T | undefined> {
     const rows = await this.all(params);
     return rows.length > 0 ? rows[0] : undefined;
   }
 
   /** Execute for side effects. Returns { rowsChanged }. */
-  async run(params = []) {
+  async run(params: Params = []): Promise<RunResult> {
     const rows = await this.all(params);
     return { rowsChanged: rows.rowsChanged };
   }
@@ -2114,7 +2381,7 @@ class Statement {
    * @param {any[]} params - positional bind parameters
    * @returns {AsyncIterableIterator<object>}
    */
-  iterate(params = []) {
+  iterate(params: Params = []): AsyncIterableIterator<T> {
     if (this.#state !== 'open') throw new DuckDBClosedError('Statement');
     if (!this.#conn || !this.#conn._isOpen()) {
       throw new DuckDBClosedError('Connection (statement\'s owning connection)');
@@ -2125,21 +2392,21 @@ class Statement {
 
     const self = this;
     const conn = this.#conn;
-    const handle = this.#handle;
+    const handle = this.#handle!;
     // ref.wrapper is filled below after the wrapper is constructed.
     // The generator reads it from its finally block to clear the
     // Connection's #activeIterator slot by identity (so a stale
     // generator can't clobber a freshly-started iterator's slot).
-    const ref = { wrapper: null };
+    const ref: { wrapper: ActiveIterator<T> | null } = { wrapper: null };
     const gen = this.#iterateImpl(handle, conn, params, ref);
 
     let started  = false;
     let finished = false;
 
-    const wrapper = {
+    const wrapper: ActiveIterator<T> = {
       [Symbol.asyncIterator]() { return wrapper; },
 
-      async next(...args) {
+      async next(...args: [] | [unknown]) {
         if (finished) return { value: undefined, done: true };
         started = true;
         try {
@@ -2150,7 +2417,7 @@ class Statement {
         }
       },
 
-      async return(value) {
+      async return(value?: unknown) {
         if (finished) return { value, done: true };
         finished = true;
         if (!started) {
@@ -2165,7 +2432,7 @@ class Statement {
         return gen.return(value);
       },
 
-      async throw(err) {
+      async throw(err?: unknown) {
         if (finished) throw err;
         finished = true;
         if (!started) {
@@ -2201,7 +2468,7 @@ class Statement {
    * @param {any[]} params - positional bind parameters
    * @returns {AsyncIterableIterator<{rows: object[], chunkIndex: number, rowOffset: number}>}
    */
-  chunks(params = []) {
+  chunks(params: Params = []): AsyncIterableIterator<RowChunk<T>> {
     if (this.#state !== 'open') throw new DuckDBClosedError('Statement');
     if (!this.#conn || !this.#conn._isOpen()) {
       throw new DuckDBClosedError('Connection (statement\'s owning connection)');
@@ -2211,23 +2478,23 @@ class Statement {
     }
 
     const conn = this.#conn;
-    const handle = this.#handle;
-    const ref = { wrapper: null };
+    const handle = this.#handle!;
+    const ref: { wrapper: ActiveIterator<RowChunk<T>> | null } = { wrapper: null };
     const gen = this.#chunksImpl(handle, conn, params, ref);
 
     let started  = false;
     let finished = false;
     const self = this;
 
-    const wrapper = {
+    const wrapper: ActiveIterator<RowChunk<T>> = {
       [Symbol.asyncIterator]() { return wrapper; },
-      async next(...args) {
+      async next(...args: [] | [unknown]) {
         if (finished) return { value: undefined, done: true };
         started = true;
         try { return await gen.next(...args); }
         catch (err) { finished = true; throw err; }
       },
-      async return(value) {
+      async return(value?: unknown) {
         if (finished) return { value, done: true };
         finished = true;
         if (!started) {
@@ -2238,7 +2505,7 @@ class Statement {
         }
         return gen.return(value);
       },
-      async throw(err) {
+      async throw(err?: unknown) {
         if (finished) throw err;
         finished = true;
         if (!started) {
@@ -2255,10 +2522,13 @@ class Statement {
     return wrapper;
   }
 
-  async *#chunksImpl(handle, conn, params, ref) {
-    let release = null;
-    let resultPtr = null;
-    let rp = 0;
+  async *#chunksImpl(
+    handle: bigint, conn: Connection, params: Params,
+    ref: { wrapper: ActiveIterator<RowChunk<T>> | null },
+  ): AsyncGenerator<RowChunk<T>, any, unknown> {
+    let release: (() => void) | null = null;
+    let resultPtr: Uint8Array | null = null;
+    let rp: Pointer | 0 = 0;
     try {
       release = await conn.acquireLock();
       if (this.#state !== 'open' || !conn._isOpen()) return;
@@ -2271,7 +2541,7 @@ class Statement {
       rp = ptr(resultPtr);
       const errPtr = lib.duckdb_result_error(rp);
       if (status !== 0 || errPtr) {
-        throw new DuckDBError(errPtr ? fromCString(errPtr) : 'Prepared execution failed');
+        throw new DuckDBError(errPtr ? fromCString(errPtr)! : 'Prepared execution failed');
       }
       const columns = conn._decodeColumnsMetadata(resultPtr);
       const chunkBuf = allocPtr();
@@ -2287,7 +2557,7 @@ class Statement {
           const rows = conn._decodeChunkRows(chunk, columns);
           // Attach .columns for convenience — same shape as QueryResult.
           rows.columns = columns;
-          yield { rows, chunkIndex, rowOffset };
+          yield { rows, chunkIndex, rowOffset } as RowChunk<T>;
           chunkIndex++;
           rowOffset += chunkSize;
         } finally {
@@ -2307,10 +2577,13 @@ class Statement {
   // the generator's finally runs (chunk destroy → result destroy → release).
   // Any helper called from here is the _xUnlocked variant (already inside
   // the lock); calling a withLock-wrapped method would deadlock.
-  async *#iterateImpl(handle, conn, params, ref) {
-    let release = null;
-    let resultPtr = null;
-    let rp = 0;
+  async *#iterateImpl(
+    handle: bigint, conn: Connection, params: Params,
+    ref: { wrapper: ActiveIterator<T> | null },
+  ): AsyncGenerator<T, any, unknown> {
+    let release: (() => void) | null = null;
+    let resultPtr: Uint8Array | null = null;
+    let rp: Pointer | 0 = 0;
 
     try {
       release = await conn.acquireLock();
@@ -2328,7 +2601,7 @@ class Statement {
       rp = ptr(resultPtr);
       const errPtr = lib.duckdb_result_error(rp);
       if (status !== 0 || errPtr) {
-        const msg = errPtr ? fromCString(errPtr) : 'Prepared execution failed';
+        const msg = errPtr ? fromCString(errPtr)! : 'Prepared execution failed';
         throw new DuckDBError(msg);
       }
 
@@ -2346,7 +2619,7 @@ class Statement {
           const chunkSize = Number(lib.duckdb_data_chunk_get_size(chunk));
           if (chunkSize === 0) break;
           const rows = conn._decodeChunkRows(chunk, columns);
-          for (const row of rows) yield row;
+          for (const row of rows) yield row as T;
         } finally {
           new DataView(chunkBuf.buffer).setBigUint64(0, BigInt(chunk), true);
           lib.duckdb_destroy_data_chunk(ptr(chunkBuf));
@@ -2368,7 +2641,7 @@ class Statement {
     }
   }
 
-  async close() {
+  async close(): Promise<void> {
     if (this.#closePromise) return this.#closePromise;
     if (this.#state !== 'open') return;
     this.#state = 'closing';
@@ -2425,12 +2698,12 @@ class Statement {
 
 const DEFAULT_CONN = Symbol('duckdb-bun.defaultConn');
 
-function _defaultConn() {
+function _defaultConn(this: Database): Connection {
   if (!this.handle) throw new DuckDBClosedError('Database');
-  if (!this[DEFAULT_CONN]) {
-    this[DEFAULT_CONN] = this.connect();
+  if (!(this as any)[DEFAULT_CONN]) {
+    (this as any)[DEFAULT_CONN] = this.connect();
   }
-  return this[DEFAULT_CONN];
+  return (this as any)[DEFAULT_CONN];
 }
 
 // All shortcut methods route through _defaultConn() so the closed-state check
@@ -2439,32 +2712,32 @@ function _defaultConn() {
 // what users expect from `await db.all(...)`.
 Object.defineProperties(Database.prototype, {
   _defaultConn: { value: _defaultConn, enumerable: false, configurable: true, writable: true },
-  query:       { value: async function (sql, params) { return _defaultConn.call(this).query(sql, params); }, enumerable: false, configurable: true, writable: true },
-  all:         { value: async function (sql, params) { return _defaultConn.call(this).all(sql, params); },   enumerable: false, configurable: true, writable: true },
-  get:         { value: async function (sql, params) { return _defaultConn.call(this).get(sql, params); },   enumerable: false, configurable: true, writable: true },
-  run:         { value: async function (sql, params) { return _defaultConn.call(this).run(sql, params); },   enumerable: false, configurable: true, writable: true },
-  exec:        { value: async function (sql)         { return _defaultConn.call(this).exec(sql); },          enumerable: false, configurable: true, writable: true },
-  prepare:     { value: async function (sql)         { return _defaultConn.call(this).prepare(sql); },       enumerable: false, configurable: true, writable: true },
-  transaction: { value: async function (fn)          { return _defaultConn.call(this).transaction(fn); },    enumerable: false, configurable: true, writable: true },
+  query:       { value: async function (this: Database, sql: string, params?: Params) { return _defaultConn.call(this).query(sql, params); }, enumerable: false, configurable: true, writable: true },
+  all:         { value: async function (this: Database, sql: string, params?: Params) { return _defaultConn.call(this).all(sql, params); },   enumerable: false, configurable: true, writable: true },
+  get:         { value: async function (this: Database, sql: string, params?: Params) { return _defaultConn.call(this).get(sql, params); },   enumerable: false, configurable: true, writable: true },
+  run:         { value: async function (this: Database, sql: string, params?: Params) { return _defaultConn.call(this).run(sql, params); },   enumerable: false, configurable: true, writable: true },
+  exec:        { value: async function (this: Database, sql: string)         { return _defaultConn.call(this).exec(sql); },          enumerable: false, configurable: true, writable: true },
+  prepare:     { value: async function (this: Database, sql: string)         { return _defaultConn.call(this).prepare(sql); },       enumerable: false, configurable: true, writable: true },
+  transaction: { value: async function <R>(this: Database, fn: (tx: TxnHandle) => Promise<R>) { return _defaultConn.call(this).transaction(fn); },    enumerable: false, configurable: true, writable: true },
   // iterate is sync (returns an AsyncIterable). The closed-state check
   // and #defaultConn allocation happen synchronously here; the actual
   // prepare + execute is lazy inside the generator (see Connection#iterate).
   iterate: {
-    value: function (sql, params) {
+    value: function (this: Database, sql: string, params?: Params) {
       const conn = _defaultConn.call(this);
       return conn.iterate(sql, params);
     },
     enumerable: false, configurable: true, writable: true,
   },
   chunks: {
-    value: function (sql, params) {
+    value: function (this: Database, sql: string, params?: Params) {
       const conn = _defaultConn.call(this);
       return conn.chunks(sql, params);
     },
     enumerable: false, configurable: true, writable: true,
   },
   pragma: {
-    value: async function (name, value) {
+    value: async function (this: Database, name: string, value?: string | number | boolean | bigint | null) {
       const conn = _defaultConn.call(this);
       if (arguments.length < 2) return conn.pragma(name);
       return conn.pragma(name, value);
@@ -2472,21 +2745,21 @@ Object.defineProperties(Database.prototype, {
     enumerable: false, configurable: true, writable: true,
   },
   installExtension: {
-    value: async function (name) {
+    value: async function (this: Database, name: string) {
       const conn = _defaultConn.call(this);
       return conn.installExtension(name);
     },
     enumerable: false, configurable: true, writable: true,
   },
   loadExtension: {
-    value: async function (name) {
+    value: async function (this: Database, name: string) {
       const conn = _defaultConn.call(this);
       return conn.loadExtension(name);
     },
     enumerable: false, configurable: true, writable: true,
   },
   checkpoint: {
-    value: async function (opts) {
+    value: async function (this: Database, opts?: CheckpointOptions) {
       const conn = _defaultConn.call(this);
       return conn.checkpoint(opts);
     },
@@ -2516,18 +2789,19 @@ Object.defineProperties(Database.prototype, {
  *   - config?: Record<string, string|number|boolean|bigint> — escape
  *     hatch for any DuckDB config key not exposed as a typed field
  */
-export function open(path, opts) {
+export function open(path: string, opts?: OpenOptions): Database {
   return new Database(path, opts);
 }
 
-export function version() {
+/** Returns the version string of the loaded libduckdb (e.g. "v1.5.2"). */
+export function version(): string {
   const versionPtr = lib.duckdb_library_version();
-  return fromCString(versionPtr);
+  return fromCString(versionPtr)!;
 }
 
 export { Database, Connection, Statement };
 
-// Internal escape hatch used by lib/async/index.mjs to call DuckDB
+// Internal escape hatch used by lib/async/index.ts to call DuckDB
 // functions directly from the main thread on connection handles
 // owned by the worker (same address space, shared libduckdb state).
 //
@@ -2541,6 +2815,10 @@ export { Database, Connection, Statement };
 //     handle as a BigInt and ships it to the main thread on connect;
 //     the main thread calls this to interrupt the worker's blocked
 //     FFI query call. Safe to call when no query is running (no-op).
+//   - libPath / shimPath: the resolved libduckdb and shim locations,
+//     for diagnostics ("which library did I actually load?").
 export const _internals = Object.freeze({
-  duckdb_interrupt: (handle) => lib.duckdb_interrupt(handle),
+  duckdb_interrupt: (handle: bigint) => lib.duckdb_interrupt(handle),
+  libPath,
+  shimPath,
 });

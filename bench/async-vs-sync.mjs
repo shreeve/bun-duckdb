@@ -13,8 +13,8 @@
 // Run:
 //   bun bench/async-vs-sync.mjs
 
-import { open as openSync } from '../lib/duckdb.mjs';
-import { open as openAsync } from '../lib/async/index.mjs';
+import { open as openSync } from '../lib/duckdb.ts';
+import { open as openAsync } from '../lib/async/index.ts';
 
 function fmt(ms) { return `${ms.toFixed(1)}ms`; }
 function pct(n) { return `${(n * 100).toFixed(1)}%`; }

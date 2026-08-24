@@ -8,7 +8,7 @@
 //
 // Run:  bun examples/cancel.mjs
 
-import { open, DuckDBAbortError, DuckDBError } from '../lib/async/index.mjs';
+import { open, DuckDBAbortError, DuckDBError } from '../lib/async/index.ts';
 
 // A query heavy enough to be reliably cancellable on any hardware.
 // CRC32 hashing on a 1B-row cartesian product is genuinely CPU-bound.

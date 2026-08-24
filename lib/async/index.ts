@@ -3,11 +3,11 @@
 // Spawns a single Worker per Database; mints monotonic numeric IDs for
 // every Database / Connection / Statement / Appender; routes every
 // public API call through one `postMessage` to the Worker and resolves
-// when the response arrives. The Worker (lib/async/worker.mjs) holds
+// when the response arrives. The Worker (lib/async/worker.ts) holds
 // the actual DuckDB handles; this side holds only IDs.
 //
 // See docs/rfcs/0001-worker-async-api.md for the design contract and
-// lib/async/protocol.d.ts for the wire shapes.
+// lib/async/protocol.ts for the wire shapes.
 
 import {
   DuckDBError,
@@ -20,13 +20,18 @@ import {
   OP,
   KIND,
   WORKER_READY,
-} from './protocol.mjs';
+} from './protocol.ts';
 
 // _internals exposes duckdb_interrupt (called directly from the main
 // thread on a worker-owned connection handle — Bun Workers share the
 // process's libduckdb state, so this is supported by DuckDB's C API).
-// See lib/duckdb.mjs near the bottom for the contract.
-import { _internals } from '../duckdb.mjs';
+// See lib/duckdb.ts near the bottom for the contract.
+import { _internals } from '../duckdb.ts';
+
+import type {
+  Row, Params, QueryResult, RunResult, AppendResult,
+  ColumnInfo, OpenOptions, RowChunk, TxnHandle, CheckpointOptions,
+} from '../duckdb.ts';
 
 export {
   DuckDBError,
@@ -40,7 +45,61 @@ export {
 // Re-export the DUCKDB_TYPE constant from the main-thread driver so
 // users of the async subpath get the same type-code mapping for
 // introspecting result.columns.
-export { DUCKDB_TYPE } from '../duckdb.mjs';
+export { DUCKDB_TYPE } from '../duckdb.ts';
+
+// Re-export the shared public types so `duckdb-bun/async` consumers can
+// import them without reaching into the sync subpath.
+export type {
+  Row, Params, QueryResult, RunResult, AppendResult, ColumnInfo,
+  OpenOptions, RowChunk, TxnHandle, CheckpointOptions,
+};
+
+// ==============================================================================
+// Option types (formerly lib/async/index.d.ts)
+// ==============================================================================
+
+/** Options for any single async op that should honor an AbortSignal. */
+export interface QueryOptions {
+  /**
+   * AbortSignal used to cancel this op. (v0.7+)
+   *
+   * If aborted at call time, the op rejects immediately without
+   * sending work to the worker. If aborted while the op is the
+   * actively-running op on its connection, the main thread calls
+   * duckdb_interrupt on the worker's connection handle and the op
+   * rejects with DuckDBAbortError. Ops queued behind the active op
+   * are not interrupted; they reject (also with DuckDBAbortError)
+   * when their turn arrives.
+   */
+  signal?: AbortSignal;
+}
+
+/** Options for streaming iteration. */
+export interface IterateOptions extends QueryOptions {
+  /**
+   * Number of chunks the worker keeps in-flight ahead of the consumer.
+   * Default 1; range [0, 4]. 0 = strict pull, max latency, min memory.
+   */
+  prefetch?: number;
+}
+
+/** Options for close() with a bounded shutdown. */
+export interface CloseOptions {
+  /** Force-terminate the worker after this many ms if in-flight ops haven't settled. */
+  timeout?: number;
+}
+
+// Internal: iterator wrappers built by AsyncStatement.iterate() always
+// implement next/return/throw, unlike the optional members on the base
+// AsyncIterableIterator interface.
+interface ActiveIterator<T = any> extends AsyncIterableIterator<T> {
+  return(value?: any): Promise<IteratorResult<T, any>>;
+  throw(e?: any): Promise<IteratorResult<T, any>>;
+}
+
+// Internal: sender callable handed to the inline-exec helpers (see
+// AsyncConnection.#sender). (method, sql) → Promise of the wire result.
+type InlineSender = (method: string, sql: string) => Promise<any>;
 
 // ----------------------------------------------------------------------
 // AbortSignal helpers — kept module-private; not part of the public API.
@@ -50,7 +109,7 @@ export { DUCKDB_TYPE } from '../duckdb.mjs';
 // Web platform allows arbitrary `reason` values (often a DOMException
 // or string); we extract a sensible message but always return a
 // DuckDBAbortError so callers can catch one type.
-function abortErrorFor(signal) {
+function abortErrorFor(signal: AbortSignal | false | null | undefined): DuckDBAbortError {
   if (!signal) return new DuckDBAbortError();
   const r = signal.reason;
   if (r instanceof Error) {
@@ -64,7 +123,7 @@ function abortErrorFor(signal) {
 
 // True if the AbortSignal-like object is in the aborted state. Treats
 // null/undefined signals as not-aborted.
-function isAborted(signal) {
+function isAborted(signal: AbortSignal | false | null | undefined): boolean {
   return !!(signal && signal.aborted);
 }
 
@@ -73,20 +132,20 @@ function isAborted(signal) {
 // ==============================================================================
 
 class AsyncDatabase {
-  #path;
-  #opts;
-  #worker = null;
-  #state = 'pre-open';          // 'pre-open' | 'opening' | 'open' | 'closing' | 'closed' | 'crashed'
-  #dbId = null;
+  #path: string;
+  #opts: OpenOptions | undefined;
+  #worker: Worker | null = null;
+  #state: 'pre-open' | 'opening' | 'open' | 'closing' | 'closed' | 'crashed' = 'pre-open';          // 'pre-open' | 'opening' | 'open' | 'closing' | 'closed' | 'crashed'
+  #dbId: number | null = null;
   #nextRequestId = 1;
-  #pending = new Map();         // id → { resolve, reject }
+  #pending = new Map<number, { resolve: (value: any) => void; reject: (err: unknown) => void }>();         // id → { resolve, reject }
   #ready = false;
-  #preReadyQueue = [];          // requests sent before the worker's ready handshake
-  #openPromise = null;
-  #openFailed = null;           // cached error after a failed open
-  #closePromise = null;
-  #crashError = null;
-  #defaultConn = null;          // lazy implicit AsyncConnection — all
+  #preReadyQueue: any[] = [];          // requests sent before the worker's ready handshake
+  #openPromise: Promise<void> | null = null;
+  #openFailed: unknown = null;           // cached error after a failed open
+  #closePromise: Promise<void> | null = null;
+  #crashError: DuckDBWorkerCrashedError | null = null;
+  #defaultConn: AsyncConnection | null = null;          // lazy implicit AsyncConnection — all
                                 // db-level shortcuts (db.query / db.exec /
                                 // db.iterate / db.prepare / ...) route
                                 // through it so AbortSignal has a stable
@@ -97,12 +156,12 @@ class AsyncDatabase {
   // `txnBegin` response. The main thread stores it here and, when an
   // AbortSignal fires for an in-flight op on that conn, calls
   // duckdb_interrupt(ptr) directly via the FFI binding declared in
-  // lib/duckdb.mjs. Bun Workers share the process's libduckdb state,
+  // lib/duckdb.ts. Bun Workers share the process's libduckdb state,
   // so this is the supported way to cancel a worker-blocked query
   // from the main thread.
-  _interruptHandles = new Map(); // connId → { ptr: bigint, generation: number }
+  _interruptHandles = new Map<number, { ptr: bigint; generation?: number }>(); // connId → { ptr: bigint, generation: number }
 
-  constructor(path, opts) {
+  constructor(path: string, opts?: OpenOptions) {
     this.#path = path;
     this.#opts = opts;
     this.#spawnWorker();
@@ -110,9 +169,9 @@ class AsyncDatabase {
 
   #spawnWorker() {
     try {
-      const url = new URL('./worker.mjs', import.meta.url);
+      const url = new URL('./worker.ts', import.meta.url);
       this.#worker = new Worker(url.href);
-    } catch (err) {
+    } catch (err: any) {
       // Sync spawn failure (file URL didn't resolve, etc.). Cache and
       // every awaited op rejects.
       this.#crashError = new DuckDBWorkerCrashedError(
@@ -130,17 +189,17 @@ class AsyncDatabase {
     // Bun doesn't fire a guaranteed 'exit' event with code, but
     // 'close' / 'messageerror' may. Hook what we can.
     if (typeof this.#worker.addEventListener === 'function') {
-      this.#worker.addEventListener('messageerror', (e) => {
+      this.#worker.addEventListener('messageerror', (e: any) => {
         this.#onCrash(`messageerror: ${e?.message || ''}`);
       });
     }
   }
 
-  #onMessage(data) {
+  #onMessage(data: any) {
     if (data && data.type === WORKER_READY) {
       this.#ready = true;
       // Flush queued messages
-      for (const req of this.#preReadyQueue) this.#worker.postMessage(req);
+      for (const req of this.#preReadyQueue) this.#worker!.postMessage(req);
       this.#preReadyQueue = [];
       return;
     }
@@ -152,7 +211,7 @@ class AsyncDatabase {
     else         pending.reject(reconstructError(data.error));
   }
 
-  #onCrash(message) {
+  #onCrash(message: string) {
     if (this.#state === 'crashed' || this.#state === 'closed') return;
     this.#crashError = new DuckDBWorkerCrashedError(
       message || 'Worker exited unexpectedly',
@@ -179,7 +238,13 @@ class AsyncDatabase {
   // open also sets state to 'crashed' (so subsequent ops are sticky),
   // but the meaningful error to surface is the original open failure,
   // not a generic crash error.
-  _send(req) {
+  // Wire-boundary escape hatch (`req: any` / `Promise<any>`): requests
+  // are structurally the Request union in protocol.ts, but several call
+  // sites build targets from ids that are `number | null` until lazy
+  // open completes (the runtime guarantees non-null by then), and each
+  // caller knows its own response shape. Typing the boundary loosely
+  // here beats sprinkling non-null assertions on every message literal.
+  _send(req: any): Promise<any> {
     if (this.#openFailed)          return Promise.reject(this.#openFailed);
     if (this.#state === 'crashed') return Promise.reject(this.#crashError || new DuckDBWorkerCrashedError('Worker crashed'));
     if (this.#state === 'closed')  return Promise.reject(new DuckDBClosedError('Database'));
@@ -189,8 +254,8 @@ class AsyncDatabase {
     return new Promise((resolve, reject) => {
       this.#pending.set(id, { resolve, reject });
       if (this.#ready) {
-        try { this.#worker.postMessage(message); }
-        catch (err) {
+        try { this.#worker!.postMessage(message); }
+        catch (err: any) {
           this.#pending.delete(id);
           reject(new DuckDBError(`postMessage failed: ${err.message}`));
         }
@@ -204,7 +269,7 @@ class AsyncDatabase {
   // database to be open. Concurrent first-callers share the same
   // promise; if open fails, the failure is cached and all subsequent
   // ops reject with the same error.
-  async #ensureOpen() {
+  async #ensureOpen(): Promise<void> {
     if (this.#state === 'open')                       return;
     if (this.#openFailed)                             throw this.#openFailed;
     if (this.#state === 'crashed')                    throw this.#crashError || new DuckDBWorkerCrashedError('Worker crashed');
@@ -231,11 +296,11 @@ class AsyncDatabase {
   }
 
   /** Read-only: numeric Database ID inside the worker. Null until lazy open completes. */
-  get id() { return this.#dbId; }
-  get _state() { return this.#state; }
+  get id(): number | null { return this.#dbId; }
+  get _state(): 'pre-open' | 'opening' | 'open' | 'closing' | 'closed' | 'crashed' { return this.#state; }
 
   /** Sync — returns an AsyncConnection proxy. The actual duckdb_connect happens lazily. */
-  connect() {
+  connect(): AsyncConnection {
     return new AsyncConnection(this);
   }
 
@@ -244,32 +309,37 @@ class AsyncDatabase {
   // first use. We keep exactly one default conn per Database so
   // signal-based cancellation has a stable connection identity for
   // db.query / db.exec / db.iterate / db.prepare / etc.
-  #getDefaultConn() {
+  #getDefaultConn(): AsyncConnection {
     if (!this.#defaultConn) this.#defaultConn = new AsyncConnection(this);
     return this.#defaultConn;
   }
 
-  query(sql, params, opts)   { return this.#getDefaultConn().query(sql, params, opts); }
-  all(sql, params, opts)     { return this.#getDefaultConn().all(sql, params, opts); }
-  get(sql, params, opts)     { return this.#getDefaultConn().get(sql, params, opts); }
-  run(sql, params, opts)     { return this.#getDefaultConn().run(sql, params, opts); }
-  exec(sql, opts)            { return this.#getDefaultConn().exec(sql, opts); }
-  prepare(sql)               { return this.#getDefaultConn().prepare(sql); }
-  iterate(sql, params, opts) { return this.#getDefaultConn().iterate(sql, params, opts); }
-  chunks(sql, params, opts)  { return this.#getDefaultConn().chunks(sql, params, opts); }
+  query<T extends Row = Row>(sql: string, params?: Params, opts?: QueryOptions): Promise<QueryResult<T>>   { return this.#getDefaultConn().query(sql, params, opts); }
+  all<T extends Row = Row>(sql: string, params?: Params, opts?: QueryOptions): Promise<QueryResult<T>>     { return this.#getDefaultConn().all(sql, params, opts); }
+  get<T extends Row = Row>(sql: string, params?: Params, opts?: QueryOptions): Promise<T | undefined>     { return this.#getDefaultConn().get(sql, params, opts); }
+  run(sql: string, params?: Params, opts?: QueryOptions): Promise<RunResult>     { return this.#getDefaultConn().run(sql, params, opts); }
+  exec(sql: string, opts?: QueryOptions): Promise<void>            { return this.#getDefaultConn().exec(sql, opts); }
+  prepare<T extends Row = Row>(sql: string): Promise<AsyncStatement<T>>               { return this.#getDefaultConn().prepare(sql); }
+  iterate<T extends Row = Row>(sql: string, params?: Params, opts?: IterateOptions): AsyncIterableIterator<T> { return this.#getDefaultConn().iterate(sql, params, opts); }
+  /** Stream rows chunk-by-chunk. (v0.5+) */
+  chunks<T extends Row = Row>(sql: string, params?: Params, opts?: QueryOptions): AsyncIterableIterator<RowChunk<T>>  { return this.#getDefaultConn().chunks(sql, params, opts); }
 
-  pragma(name, value) {
+  /** Run `PRAGMA name` (get) or `PRAGMA name=value` (set). (v0.5+) */
+  pragma(name: string, value?: string | number | boolean | bigint | null): Promise<Row | undefined> {
     // Preserve the 1-vs-2-argument distinction (get vs set) — can't
     // delegate via `...rest` because that would always pass 2 args.
     const c = this.#getDefaultConn();
     return arguments.length < 2 ? c.pragma(name) : c.pragma(name, value);
   }
 
-  installExtension(name) { return this.#getDefaultConn().installExtension(name); }
-  loadExtension(name)    { return this.#getDefaultConn().loadExtension(name); }
-  checkpoint(opts)       { return this.#getDefaultConn().checkpoint(opts); }
+  /** `INSTALL <name>` with strict identifier validation. (v0.5+) */
+  installExtension(name: string): Promise<void> { return this.#getDefaultConn().installExtension(name); }
+  /** `LOAD <name>` with strict identifier validation. (v0.5+) */
+  loadExtension(name: string): Promise<void>    { return this.#getDefaultConn().loadExtension(name); }
+  /** Flush the WAL via `CHECKPOINT` (or `FORCE CHECKPOINT`). (v0.5.1+) */
+  checkpoint(opts?: CheckpointOptions): Promise<void>       { return this.#getDefaultConn().checkpoint(opts); }
 
-  async transaction(fn) {
+  async transaction<R>(fn: (tx: AsyncConnection) => Promise<R>): Promise<R> {
     await this.#ensureOpen();
     return runTransaction(this, { kind: KIND.DB, id: this.#dbId }, fn);
   }
@@ -284,7 +354,7 @@ class AsyncDatabase {
    *   - timeout: number of ms to wait for in-flight ops before forcing
    *     worker.terminate(). Default: no timeout (waits forever).
    */
-  async close(opts) {
+  async close(opts?: CloseOptions): Promise<void> {
     if (this.#closePromise) return this.#closePromise;
     if (this.#state === 'closed' || this.#state === 'crashed') {
       this.#state = 'closed';
@@ -305,7 +375,7 @@ class AsyncDatabase {
         this.#defaultConn = null;
       }
 
-      let closeTask;
+      let closeTask: Promise<unknown>;
       if (wasOpen) {
         closeTask = this._send({
           op: OP.CLOSE, target: { kind: KIND.DB, id: this.#dbId },
@@ -315,7 +385,7 @@ class AsyncDatabase {
       }
 
       if (typeof timeout === 'number') {
-        let timer;
+        let timer: ReturnType<typeof setTimeout> | undefined;
         const timedOut = new Promise(resolve => {
           timer = setTimeout(() => resolve('timeout'), timeout);
         });
@@ -361,25 +431,25 @@ class AsyncDatabase {
 // ==============================================================================
 
 class AsyncConnection {
-  #db;
-  #connId = null;
-  #connectPromise = null;
-  #state = 'pre-open';     // 'pre-open' | 'opening' | 'open' | 'closing' | 'closed'
-  #closePromise = null;
+  #db: AsyncDatabase;
+  #connId: number | null = null;
+  #connectPromise: Promise<void> | null = null;
+  #state: 'pre-open' | 'opening' | 'open' | 'closing' | 'closed' = 'pre-open';     // 'pre-open' | 'opening' | 'open' | 'closing' | 'closed'
+  #closePromise: Promise<void> | null = null;
   #inTransaction = false;
   // Per-conn serialization chain. All async ops (query/exec/run/all/
   // get/iter*/append*/pragma/etc.) enqueue onto this so at most ONE
   // op is in flight to the worker at any time on this conn. Matches
   // the sync driver's per-Connection lock semantics, and gives us a
   // well-defined "active request" for AbortSignal cancellation.
-  #serialChain = Promise.resolve();
+  #serialChain: Promise<unknown> = Promise.resolve();
   // Identity of the currently active op (null when idle). Set inside
   // #runSerial and cleared in its finally. AbortSignal handler checks
   // that the active token still matches its own before firing
   // duckdb_interrupt, so a stale handler can't interrupt a later op.
-  #activeOp = null;        // { token: object, signal: AbortSignal | undefined }
+  #activeOp: { token: object; signal: AbortSignal | false | undefined } | null = null;        // { token: object, signal: AbortSignal | undefined }
 
-  constructor(db, /** optional pre-allocated connId (used by transaction) */ preConnId = null,
+  constructor(db: AsyncDatabase, /** optional pre-allocated connId (used by transaction) */ preConnId: number | null = null,
               /** mark this conn as already inside a transaction (used by runTransaction's txConn) */
               isTxnConn = false) {
     this.#db = db;
@@ -390,10 +460,10 @@ class AsyncConnection {
     if (isTxnConn) this.#inTransaction = true;
   }
 
-  get id() { return this.#connId; }
-  get _state() { return this.#state; }
+  get id(): number | null { return this.#connId; }
+  get _state(): 'pre-open' | 'opening' | 'open' | 'closing' | 'closed' { return this.#state; }
 
-  async #ensureOpen() {
+  async #ensureOpen(): Promise<void> {
     if (this.#state === 'open')    return;
     if (this.#state === 'closed')  throw new DuckDBClosedError('Connection');
     if (this.#state === 'closing') throw new DuckDBClosedError('Connection');
@@ -461,7 +531,7 @@ class AsyncConnection {
   // (because the signal is already aborted when they enter the
   // serial body) — never reach the worker. This satisfies the
   // "abort queued does not interrupt active" invariant.
-  async #runSerial(opts, fn) {
+  async #runSerial(opts: QueryOptions | undefined, fn: () => any): Promise<any> {
     const signal = opts && opts.signal;
     if (isAborted(signal)) throw abortErrorFor(signal);
     if (this.#state === 'closed' || this.#state === 'closing') {
@@ -544,7 +614,7 @@ class AsyncConnection {
                way this throws, and the response will still resolve. */ }
   }
 
-  #queryOp(method, sql, params, opts) {
+  #queryOp(method: 'query' | 'all' | 'get' | 'run' | 'exec', sql: string, params: Params | undefined, opts: QueryOptions | undefined) {
     return this.#runSerial(opts, () =>
       this.#db._send({
         op: OP.QUERY, target: { kind: KIND.CONN, id: this.#connId },
@@ -553,13 +623,13 @@ class AsyncConnection {
     );
   }
 
-  query(sql, params, opts) { return this.#queryOp('query', sql, params, opts); }
-  all(sql, params, opts)   { return this.#queryOp('all',   sql, params, opts); }
-  get(sql, params, opts)   { return this.#queryOp('get',   sql, params, opts); }
-  run(sql, params, opts)   { return this.#queryOp('run',   sql, params, opts); }
-  exec(sql, opts)          { return this.#queryOp('exec',  sql, undefined, opts); }
+  query<T extends Row = Row>(sql: string, params?: Params, opts?: QueryOptions): Promise<QueryResult<T>> { return this.#queryOp('query', sql, params, opts); }
+  all<T extends Row = Row>(sql: string, params?: Params, opts?: QueryOptions): Promise<QueryResult<T>>   { return this.#queryOp('all',   sql, params, opts); }
+  get<T extends Row = Row>(sql: string, params?: Params, opts?: QueryOptions): Promise<T | undefined>   { return this.#queryOp('get',   sql, params, opts); }
+  run(sql: string, params?: Params, opts?: QueryOptions): Promise<RunResult>   { return this.#queryOp('run',   sql, params, opts); }
+  exec(sql: string, opts?: QueryOptions): Promise<void>          { return this.#queryOp('exec',  sql, undefined, opts); }
 
-  async prepare(sql) {
+  async prepare<T extends Row = Row>(sql: string): Promise<AsyncStatement<T>> {
     // Prepare itself doesn't take a signal — it's quick and the
     // resulting Statement carries its own per-call signal support.
     return this.#runSerial(undefined, async () => {
@@ -570,34 +640,39 @@ class AsyncConnection {
     });
   }
 
-  iterate(sql, params, opts) {
+  iterate<T extends Row = Row>(sql: string, params?: Params, opts?: IterateOptions): AsyncIterableIterator<T> {
     return iterateThroughConn(this, sql, params, opts);
   }
 
-  chunks(sql, params, opts) {
+  /** Stream rows chunk-by-chunk. (v0.5+) */
+  chunks<T extends Row = Row>(sql: string, params?: Params, opts?: QueryOptions): AsyncIterableIterator<RowChunk<T>> {
     return chunksThroughConn(this, sql, params, opts);
   }
 
-  pragma(name, value) {
+  /** Run `PRAGMA name` (get) or `PRAGMA name=value` (set). (v0.5+) */
+  pragma(name: string, value?: string | number | boolean | bigint | null): Promise<Row | undefined> {
     const isGet = arguments.length < 2;
     return this.#runSerial(undefined, () =>
       execPragmaInline(this.#sender(), name, value, isGet),
     );
   }
 
-  installExtension(name) {
+  /** `INSTALL <name>` with strict identifier validation. (v0.5+) */
+  installExtension(name: string): Promise<void> {
     return this.#runSerial(undefined, () =>
       execExtensionInline(this.#sender(), 'INSTALL', name),
     );
   }
 
-  loadExtension(name) {
+  /** `LOAD <name>` with strict identifier validation. (v0.5+) */
+  loadExtension(name: string): Promise<void> {
     return this.#runSerial(undefined, () =>
       execExtensionInline(this.#sender(), 'LOAD', name),
     );
   }
 
-  checkpoint(opts) {
+  /** Flush the WAL via `CHECKPOINT` (or `FORCE CHECKPOINT`). (v0.5.1+) */
+  checkpoint(opts?: CheckpointOptions): Promise<void> {
     return this.#runSerial(undefined, () =>
       execCheckpointInline(this.#sender(), opts),
     );
@@ -606,7 +681,7 @@ class AsyncConnection {
   // Build a sender bound to this conn's id. Returns (method, sql) → Promise.
   // Used by inline-exec helpers that already run inside #runSerial and
   // must NOT re-enter the chain (would deadlock).
-  #sender() {
+  #sender(): InlineSender {
     const db = this.#db;
     const connId = this.#connId;
     return (method, sql) => db._send({
@@ -617,12 +692,12 @@ class AsyncConnection {
   // Internal: send a request through the serialization chain. Used by
   // AsyncStatement so prepared-statement calls and iterations on a
   // given connection serialize against the connection's other ops.
-  _runSerial(opts, fn) { return this.#runSerial(opts, fn); }
+  _runSerial(opts: QueryOptions | undefined, fn: () => any): Promise<any> { return this.#runSerial(opts, fn); }
   // Internal: an "I am inside #runSerial — let me send raw" escape
   // hatch. Returns a sender callable that bypasses serialization.
   // AsyncStatement uses this to route stmt calls through its owning
   // conn's serialization chain.
-  _rawSender() { return this.#sender(); }
+  _rawSender(): InlineSender { return this.#sender(); }
   // Internal: called by an iterator's abort handler to interrupt the
   // worker-side query without going through #runSerial. The iterator
   // owns its own serialization (one in-flight iterNext at a time on
@@ -633,7 +708,7 @@ class AsyncConnection {
   // #interrupt path as regular ops without needing #runSerial.
   // Returns the underlying promise so the caller's await preserves
   // ordering semantics.
-  async _withActiveIterChunk(fn) {
+  async _withActiveIterChunk(fn: () => Promise<any>): Promise<any> {
     const token = {};
     this.#activeOp = { token, signal: undefined };
     try { return await fn(); }
@@ -642,8 +717,16 @@ class AsyncConnection {
     }
   }
 
-  /** Bulk insert via the Appender API. Returns an AsyncAppender proxy. */
-  async append(table, columns, rows) {
+  /**
+   * Bulk insert via the Appender API. Two forms:
+   *   - One-shot: `conn.append(table, columns, rows)` — sends rows,
+   *     flushes, returns `{ rows: number }`. Mirrors v0.3 main-thread.
+   *   - Streaming: `conn.append(table, columns)` returns an
+   *     `AsyncAppender` proxy the caller drives.
+   */
+  async append(table: string, columns: string[], rows: unknown[][]): Promise<AppendResult>;
+  async append(table: string, columns: string[]): Promise<AsyncAppender>;
+  async append(table: string, columns: string[], rows?: unknown[][]): Promise<AppendResult | AsyncAppender> {
     // For convenience, support the one-shot signature
     // `conn.append(table, columns, rows)` that v0.3 uses.
     await this.#ensureOpen();
@@ -673,7 +756,7 @@ class AsyncConnection {
     return new AsyncAppender(this.#db, appId);
   }
 
-  async transaction(fn) {
+  async transaction<R>(fn: (tx: AsyncConnection) => Promise<R>): Promise<R> {
     await this.#ensureOpen();
     if (this.#inTransaction) {
       throw new DuckDBTransactionError('Nested transactions are not supported');
@@ -686,7 +769,7 @@ class AsyncConnection {
     }
   }
 
-  async close() {
+  async close(): Promise<void> {
     if (this.#closePromise) return this.#closePromise;
     if (this.#state === 'closed') return;
     const wasOpen = this.#state === 'open' && this.#connId !== null;
@@ -729,24 +812,24 @@ class AsyncConnection {
 // AsyncStatement
 // ==============================================================================
 
-class AsyncStatement {
-  #db;
-  #stmtId;
-  #conn;                    // owning AsyncConnection (or null if owned by db's implicit)
-  #state = 'open';          // 'open' | 'closing' | 'closed'
-  #closePromise = null;
-  #activeIterator = null;
+class AsyncStatement<T extends Row = Row> {
+  #db: AsyncDatabase;
+  #stmtId: number;
+  #conn: AsyncConnection | null;                    // owning AsyncConnection (or null if owned by db's implicit)
+  #state: 'open' | 'closing' | 'closed' = 'open';          // 'open' | 'closing' | 'closed'
+  #closePromise: Promise<void> | null = null;
+  #activeIterator: ActiveIterator<T> | null = null;
 
-  constructor(db, stmtId, conn = null) {
+  constructor(db: AsyncDatabase, stmtId: number, conn: AsyncConnection | null = null) {
     this.#db = db;
     this.#stmtId = stmtId;
     this.#conn = conn;
   }
 
-  get id() { return this.#stmtId; }
-  get closed() { return this.#state !== 'open'; }
+  get id(): number { return this.#stmtId; }
+  get closed(): boolean { return this.#state !== 'open'; }
 
-  #stmtCall(method, params, opts) {
+  #stmtCall(method: 'all' | 'get' | 'run', params: Params | undefined, opts: QueryOptions | undefined) {
     if (this.#state !== 'open') return Promise.reject(new DuckDBClosedError('Statement'));
     if (this.#activeIterator) return Promise.reject(new DuckDBError('Statement is iterating; consume or close the iterator first'));
     // If we have an owning AsyncConnection, route through its serial
@@ -762,9 +845,9 @@ class AsyncStatement {
     return sendRaw();
   }
 
-  all(params, opts) { return this.#stmtCall('all', params, opts); }
-  get(params, opts) { return this.#stmtCall('get', params, opts); }
-  run(params, opts) { return this.#stmtCall('run', params, opts); }
+  all(params?: Params, opts?: QueryOptions): Promise<QueryResult<T>> { return this.#stmtCall('all', params, opts); }
+  get(params?: Params, opts?: QueryOptions): Promise<T | undefined> { return this.#stmtCall('get', params, opts); }
+  run(params?: Params, opts?: QueryOptions): Promise<RunResult> { return this.#stmtCall('run', params, opts); }
 
   /**
    * Stream rows from a prepared statement. Pull-based per-chunk.
@@ -780,7 +863,7 @@ class AsyncStatement {
    *     an exhausted chunk), the next call to .next() rejects with
    *     DuckDBAbortError.
    */
-  iterate(params, opts) {
+  iterate(params?: Params, opts?: IterateOptions): AsyncIterableIterator<T> {
     if (this.#state !== 'open') throw new DuckDBClosedError('Statement');
     if (this.#activeIterator) throw new DuckDBError('Statement is already iterating');
 
@@ -791,13 +874,13 @@ class AsyncStatement {
     const conn = this.#conn;
     const stmtId = this.#stmtId;
 
-    let iterId = null;
+    let iterId: number | null = null;
     let started  = false;
     let finished = false;
-    let buffer = [];
+    let buffer: any[] = [];
     let bufferIdx = 0;
     let exhausted = false;
-    let nextChunk = null;     // in-flight prefetch promise
+    let nextChunk: Promise<any> | null = null;     // in-flight prefetch promise
 
     // The signal arms a flag that .next() and the in-flight prefetch
     // honor. The handler also fires duckdb_interrupt on the owning
@@ -817,7 +900,7 @@ class AsyncStatement {
     } : null;
     if (signal) {
       if (signal.aborted) aborted = true;
-      else signal.addEventListener('abort', abortHandler, { once: true });
+      else signal.addEventListener('abort', abortHandler!, { once: true });
     }
 
     function abortIfNeeded() {
@@ -849,7 +932,7 @@ class AsyncStatement {
       );
     }
 
-    async function nextRow() {
+    async function nextRow(): Promise<IteratorResult<any>> {
       abortIfNeeded();
       // Drain local buffer first
       if (bufferIdx < buffer.length) return { value: buffer[bufferIdx++], done: false };
@@ -886,7 +969,7 @@ class AsyncStatement {
       }
     }
 
-    const wrapper = {
+    const wrapper: ActiveIterator<T> = {
       [Symbol.asyncIterator]() { return wrapper; },
 
       async next() {
@@ -925,7 +1008,7 @@ class AsyncStatement {
         }
       },
 
-      async return(value) {
+      async return(value?: unknown) {
         if (finished) return { value, done: true };
         finished = true;
         if (started) await cleanup();
@@ -936,7 +1019,7 @@ class AsyncStatement {
         return { value, done: true };
       },
 
-      async throw(err) {
+      async throw(err?: unknown) {
         if (finished) throw err;
         finished = true;
         if (started) await cleanup();
@@ -952,7 +1035,7 @@ class AsyncStatement {
     return wrapper;
   }
 
-  async close() {
+  async close(): Promise<void> {
     if (this.#closePromise) return this.#closePromise;
     if (this.#state !== 'open') return;
     this.#state = 'closing';
@@ -980,22 +1063,24 @@ class AsyncStatement {
 // ==============================================================================
 
 class AsyncAppender {
-  #db;
-  #appId;
-  #state = 'open';
-  #closePromise = null;
-  #poisoned = null;
-  #pending = null;            // in-flight appendRows promise
-  #buffer = [];
-  #batchSize;
+  #db: AsyncDatabase;
+  #appId: number;
+  #state: 'open' | 'closing' | 'closed' = 'open';
+  #closePromise: Promise<void> | null = null;
+  #poisoned: unknown = null;
+  #pending: Promise<any> | null = null;            // in-flight appendRows promise
+  #buffer: unknown[][] = [];
+  #batchSize: number;
 
-  constructor(db, appId, opts = {}) {
+  constructor(db: AsyncDatabase, appId: number, opts: { batchSize?: number } = {}) {
     this.#db = db;
     this.#appId = appId;
-    this.#batchSize = (opts.batchSize | 0) || 1000;
+    // `!` is type-only: `undefined | 0` evaluates to 0 at runtime, which
+    // the `|| 1000` then replaces — same result as before.
+    this.#batchSize = (opts.batchSize! | 0) || 1000;
   }
 
-  get closed() { return this.#state !== 'open'; }
+  get closed(): boolean { return this.#state !== 'open'; }
 
   /**
    * Append one row. Sync (matches main-thread API). Buffers locally;
@@ -1003,7 +1088,7 @@ class AsyncAppender {
    * close(). Throws synchronously on closed/poisoned state — the proxy
    * cache enforces this without a worker round-trip.
    */
-  appendRow(values) {
+  appendRow(values: unknown[]): void {
     if (this.#state !== 'open') throw new DuckDBClosedError('Appender');
     if (this.#poisoned)        throw this.#poisoned;
     this.#buffer.push(values);
@@ -1024,7 +1109,7 @@ class AsyncAppender {
     }
   }
 
-  async flush() {
+  async flush(): Promise<AppendResult> {
     if (this.#poisoned)        throw this.#poisoned;
     // 'closing' is allowed — close() calls flush() during teardown.
     // Only 'closed' is too late to drain buffered rows.
@@ -1050,7 +1135,7 @@ class AsyncAppender {
     } catch (err) { this.#poisoned = err; throw err; }
   }
 
-  async close() {
+  async close(): Promise<void> {
     if (this.#closePromise) return this.#closePromise;
     if (this.#state !== 'open') return;
     this.#state = 'closing';
@@ -1074,7 +1159,7 @@ class AsyncAppender {
 // Shared helpers
 // ==============================================================================
 
-function clampPrefetch(v) {
+function clampPrefetch(v: unknown): number {
   if (typeof v !== 'number' || Number.isNaN(v)) return 1;
   if (v < 0) return 0;
   if (v > 4) return 4;
@@ -1084,7 +1169,7 @@ function clampPrefetch(v) {
 // Connection.iterate(sql) / Database.iterate(sql) sugar. Lazy-prepare:
 // nothing happens until the consumer's first .next(). The temp Statement
 // is closed in `finally` regardless of how the iterator terminates.
-function iterateThroughConn(target, sql, params, opts) {
+function iterateThroughConn(target: AsyncConnection, sql: string, params: Params | undefined, opts: IterateOptions | undefined): AsyncIterableIterator<any> {
   return (async function* () {
     const stmt = await target.prepare(sql);
     try {
@@ -1099,7 +1184,7 @@ function iterateThroughConn(target, sql, params, opts) {
 // transport already buffers per-chunk; this just exposes that
 // directly to the consumer. Honors opts.signal via the underlying
 // iterate path.
-function chunksThroughConn(target, sql, params, opts) {
+function chunksThroughConn(target: AsyncConnection, sql: string, params: Params | undefined, opts: IterateOptions | undefined): AsyncIterableIterator<any> {
   return (async function* () {
     const stmt = await target.prepare(sql);
     try {
@@ -1108,7 +1193,7 @@ function chunksThroughConn(target, sql, params, opts) {
       // the proxy side. Matches DuckDB's natural chunk size and avoids
       // new protocol surface.
       const BUFFER_SIZE = 2048;
-      let buf = [];
+      let buf: any[] = [];
       let chunkIndex = 0;
       let rowOffset = 0;
       for await (const row of stmt.iterate(params, opts)) {
@@ -1132,13 +1217,13 @@ function chunksThroughConn(target, sql, params, opts) {
 // the generated SQL goes through the normal query path.
 const ASYNC_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-function assertAsyncIdent(name, label) {
+function assertAsyncIdent(name: string, label: string) {
   if (typeof name !== 'string' || !ASYNC_IDENT_RE.test(name)) {
     throw new DuckDBError(`Invalid ${label}: ${JSON.stringify(name)}`);
   }
 }
 
-function quoteAsyncSqlLiteral(value) {
+function quoteAsyncSqlLiteral(value: unknown): string {
   if (value === null || value === undefined) return 'NULL';
   if (typeof value === 'boolean') return value ? 'TRUE' : 'FALSE';
   if (typeof value === 'number') {
@@ -1156,19 +1241,19 @@ function quoteAsyncSqlLiteral(value) {
 // they can run inside an AsyncConnection's #runSerial without
 // recursively entering the serialization chain. AsyncConnection
 // passes #sender() bound to its connId.
-async function execPragmaInline(send, name, value, isGet) {
+async function execPragmaInline(send: InlineSender, name: string, value: unknown, isGet: boolean) {
   assertAsyncIdent(name, 'PRAGMA name');
   const sql = isGet ? `PRAGMA ${name}` : `PRAGMA ${name}=${quoteAsyncSqlLiteral(value)}`;
   const rows = await send('all', sql);
   return rows.length > 0 ? rows[0] : undefined;
 }
 
-async function execExtensionInline(send, kind /* 'INSTALL' | 'LOAD' */, name) {
+async function execExtensionInline(send: InlineSender, kind: string /* 'INSTALL' | 'LOAD' */, name: string) {
   assertAsyncIdent(name, 'extension name');
   await send('exec', `${kind} ${name}`);
 }
 
-async function execCheckpointInline(send, opts) {
+async function execCheckpointInline(send: InlineSender, opts: CheckpointOptions | undefined) {
   const force = opts && opts.force === true;
   let sql = force ? 'FORCE CHECKPOINT' : 'CHECKPOINT';
   if (opts && opts.database !== undefined) {
@@ -1182,7 +1267,7 @@ async function execCheckpointInline(send, opts) {
 // called `.transaction()` on. We allocate a fresh worker-side
 // Connection for the transaction's lifetime, hand the user a proxy
 // for it, and emit commit/rollback based on the callback's outcome.
-async function runTransaction(db, txnTarget, fn) {
+async function runTransaction(db: AsyncDatabase, txnTarget: any, fn: (tx: AsyncConnection) => Promise<any>): Promise<any> {
   const res = await db._send({ op: OP.TXN_BEGIN, target: txnTarget });
   const { connId } = res;
   // Cache the txn conn's interrupt capability so AbortSignal can
@@ -1220,9 +1305,9 @@ async function runTransaction(db, txnTarget, fn) {
  * @param {string} path - file path, or ':memory:' for in-memory
  * @param {object} [opts] - same shape as the main-thread `open(path, opts)`:
  *   readOnly, accessMode, threads, memoryLimit, tempDirectory, config.
- *   See the sync `open()` docs in lib/duckdb.mjs.
+ *   See the sync `open()` docs in lib/duckdb.ts.
  */
-export function open(path, opts) {
+export function open(path: string, opts?: OpenOptions): AsyncDatabase {
   return new AsyncDatabase(path, opts);
 }
 
@@ -1233,10 +1318,10 @@ export { AsyncDatabase, AsyncConnection, AsyncStatement, AsyncAppender };
 // For simplicity (and because async-version requires the worker to be
 // alive), the sync main-thread version() is preferred — but we expose
 // an async one here for parity.
-export async function version() {
+export async function version(): Promise<string> {
   // Use a transient AsyncDatabase to fetch the version from the worker.
   // For ergonomics we just delegate to the main-thread driver which
   // already does a sync FFI call.
-  const m = await import('../duckdb.mjs');
+  const m = await import('../duckdb.ts');
   return m.version();
 }

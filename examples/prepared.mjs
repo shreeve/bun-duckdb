@@ -10,7 +10,7 @@
 // Run:
 //   bun examples/prepared.mjs
 
-import { open } from '../lib/duckdb.mjs';
+import { open } from '../lib/duckdb.ts';
 
 using db = open(':memory:');
 

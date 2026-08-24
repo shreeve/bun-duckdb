@@ -1,26 +1,27 @@
 {
   "name": "duckdb-bun",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Efficient DuckDB driver for Bun, using pure FFI",
   "type": "module",
   "sideEffects": false,
-  "main": "./lib/duckdb.mjs",
-  "types": "./lib/duckdb.d.ts",
+  "main": "./lib/duckdb.ts",
+  "types": "./lib/duckdb.ts",
   "exports": {
     ".": {
-      "types": "./lib/duckdb.d.ts",
-      "import": "./lib/duckdb.mjs",
-      "default": "./lib/duckdb.mjs"
+      "types": "./lib/duckdb.ts",
+      "bun": "./lib/duckdb.ts",
+      "import": "./lib/duckdb.ts",
+      "default": "./lib/duckdb.ts"
     },
     "./async": {
-      "types": "./lib/async/index.d.ts",
-      "import": "./lib/async/index.mjs",
-      "default": "./lib/async/index.mjs"
+      "types": "./lib/async/index.ts",
+      "bun": "./lib/async/index.ts",
+      "import": "./lib/async/index.ts",
+      "default": "./lib/async/index.ts"
     }
   },
   "files": [
-    "lib/duckdb.mjs",
-    "lib/duckdb.d.ts",
+    "lib/duckdb.ts",
     "lib/duckdb-shim.c",
     "lib/Makefile",
     "lib/build.ps1",
@@ -29,11 +30,9 @@
     "lib/libduckdb-shim-darwin-x64.dylib",
     "lib/libduckdb-shim-darwin-arm64.dylib",
     "lib/libduckdb-shim-win32-x64.dll",
-    "lib/async/index.mjs",
-    "lib/async/index.d.ts",
-    "lib/async/worker.mjs",
-    "lib/async/protocol.mjs",
-    "lib/async/protocol.d.ts",
+    "lib/async/index.ts",
+    "lib/async/worker.ts",
+    "lib/async/protocol.ts",
     "README.md",
     "AGENTS.md",
     "CHANGELOG.md",
@@ -72,9 +71,13 @@
   },
   "homepage": "https://github.com/shreeve/duckdb-bun#readme",
   "engines": {
-    "bun": ">=1.1.0"
+    "bun": ">=1.4.0"
   },
   "publishConfig": {
     "access": "public"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.0",
+    "typescript": "7.0.2"
   }
 }

@@ -1,11 +1,156 @@
-// TypeScript types for the duckdb-bun/async wire protocol.
+// Shared protocol constants + error machinery for duckdb-bun/async.
 //
-// Imported separately from protocol.mjs because that file is shipped as
-// pure ESM (no transpile step). The matching runtime constants
-// (OP, KIND, WORKER_READY, ERROR_CLASSES, DuckDBWorkerCrashedError,
-// serializeError, reconstructError) live in protocol.mjs.
+// This file is imported by BOTH lib/async/index.ts (main thread) and
+// lib/async/worker.ts (Worker thread). It deliberately holds no
+// runtime state — just constants and error class wiring.
+//
+// Type declarations for the Request / Response / Target shapes live at
+// the bottom of this file (formerly lib/async/protocol.d.ts — the
+// package now ships TypeScript source directly, no transpile step).
 
-import type { Params, Row } from '../../lib/duckdb.d.ts';
+import {
+  DuckDBError,
+  DuckDBClosedError,
+  DuckDBPrepareError,
+  DuckDBTransactionError,
+  DuckDBAbortError,
+} from '../duckdb.ts';
+
+import type { Params, Row } from '../duckdb.ts';
+
+// ==============================================================================
+// Worker-specific error
+//
+// Thrown on the main thread when the Worker exits unexpectedly (uncaught
+// exception inside the worker, terminate() from anywhere, OS kill).
+// All pending request promises reject with this; future calls on any
+// proxy from that Database reject with DuckDBClosedError. No promise
+// hangs forever.
+// ==============================================================================
+
+export class DuckDBWorkerCrashedError extends DuckDBError {
+  declare readonly name: 'DuckDBWorkerCrashedError';
+
+  constructor(message?: string) {
+    super(message);
+    this.name = 'DuckDBWorkerCrashedError';
+  }
+}
+
+// Re-export the main-thread error classes so consumers of duckdb-bun/async
+// can `import { DuckDBError, DuckDBClosedError, ... } from 'duckdb-bun/async'`
+// and get the same identities the main-thread driver uses. The shared
+// identity matters for `instanceof` checks against errors raised by
+// either subpath.
+export {
+  DuckDBError,
+  DuckDBClosedError,
+  DuckDBPrepareError,
+  DuckDBTransactionError,
+  DuckDBAbortError,
+};
+
+// ==============================================================================
+// Error reconstruction registry
+//
+// Both threads import from here. When the worker catches an error from
+// the v0.3 driver, it serializes it to { name, message, stack, code,
+// cause? } and posts it back. The main thread looks up the name here
+// and constructs a real subclass instance, preserving message + stack
+// and recursing for `cause`.
+//
+// If a name isn't registered, fall through to DuckDBError so the error
+// still propagates as a DuckDB error (just without its specific
+// subclass). A CI test in test/async/errors.test.mjs guards against
+// new DuckDB* error classes that fail to register here.
+// ==============================================================================
+
+export const ERROR_CLASSES = Object.freeze({
+  DuckDBError,
+  DuckDBClosedError,
+  DuckDBPrepareError,
+  DuckDBTransactionError,
+  DuckDBWorkerCrashedError,
+  DuckDBAbortError,
+  // 'AbortError' is the .name DuckDBAbortError uses (Web standard
+  // convention). The serializer keys on .name, so register an alias
+  // that maps the name back to the right class on the main thread.
+  AbortError: DuckDBAbortError,
+});
+
+/** Serialize an Error (any subclass) for transmission across postMessage. */
+export function serializeError(err: any): SerializedError {
+  if (!err) return { name: 'Error', message: String(err) };
+  return {
+    name: err.name || 'Error',
+    message: err.message || String(err),
+    stack: typeof err.stack === 'string' ? err.stack : undefined,
+    code: err.code,
+    cause: err.cause ? serializeError(err.cause) : undefined,
+  };
+}
+
+/** Reconstruct an Error on the main thread from its serialized form. */
+export function reconstructError(serialized: SerializedError | null | undefined): DuckDBError {
+  if (!serialized) return new DuckDBError('Unknown worker error');
+  const Cls = (ERROR_CLASSES as Record<string, typeof DuckDBError>)[serialized.name] || DuckDBError;
+  const err = new Cls(serialized.message || '');
+  if (serialized.stack) {
+    // Prefix so it's visually distinguishable from main-thread frames in
+    // mixed stack traces — the worker's stack is otherwise the actual
+    // file paths inside the .async/ subpath which can be confusing.
+    err.stack = `[worker] ${serialized.stack}`;
+  }
+  if (serialized.code) (err as any).code = serialized.code;
+  if (serialized.cause) err.cause = reconstructError(serialized.cause);
+  return err;
+}
+
+// ==============================================================================
+// Op constants — string values match the discriminated Request union
+// declared below. Using constants instead of bare string
+// literals at call sites makes typos a sync error rather than a
+// silent "unknown op" reject.
+// ==============================================================================
+
+export const OP = Object.freeze({
+  OPEN:         'open',
+  CLOSE:        'close',
+  RELEASE:      'release',
+  CONNECT:      'connect',
+  QUERY:        'query',
+  PREPARE:      'prepare',
+  STMT_CALL:    'stmtCall',
+  ITER_START:   'iterStart',
+  ITER_NEXT:    'iterNext',
+  ITER_RETURN:  'iterReturn',
+  APP_CREATE:   'appendCreate',
+  APP_ROWS:     'appendRows',
+  APP_FLUSH:    'appendFlush',
+  TXN_BEGIN:    'txnBegin',
+  TXN_COMMIT:   'txnCommit',
+  TXN_ROLLBACK: 'txnRollback',
+} as const);
+
+// Target.kind constants — same rationale as OP.
+export const KIND = Object.freeze({
+  DB:   'db',
+  CONN: 'conn',
+  STMT: 'stmt',
+  APP:  'app',
+} as const);
+
+// Worker → main "ready" handshake type. The Worker posts this once its
+// module has loaded; the proxy queues outgoing requests until it
+// arrives. (See lib/async/index.ts §preReadyQueue.)
+export const WORKER_READY = '__duckdb_bun_worker_ready__';
+
+// ==============================================================================
+// Wire protocol types (formerly lib/async/protocol.d.ts)
+//
+// The matching runtime constants (OP, KIND, WORKER_READY, ERROR_CLASSES,
+// DuckDBWorkerCrashedError, serializeError, reconstructError) live above.
+// ==============================================================================
 
 // ============================================================================
 // Targets
@@ -89,7 +234,7 @@ export interface SerializedError {
 }
 
 // ============================================================================
-// Op string constants (re-exported from protocol.mjs as runtime values).
+// Op string constants (declared as runtime values above).
 // ============================================================================
 
 export type OpName = Request['op'];

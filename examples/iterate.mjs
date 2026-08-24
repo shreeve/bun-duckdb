@@ -8,7 +8,7 @@
 // Run:
 //   bun examples/iterate.mjs
 
-import { open } from '../lib/duckdb.mjs';
+import { open } from '../lib/duckdb.ts';
 
 // `await using` (Symbol.asyncDispose) is the recommended dispose pattern
 // for the streaming era — it waits for iterator cleanup before db.close()

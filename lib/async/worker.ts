@@ -5,11 +5,46 @@
 // Database, Connection, Statement, Appender) to live driver objects.
 // All DuckDB FFI happens here; the main thread never sees raw handles.
 //
-// Protocol: see lib/async/protocol.d.ts. The dispatcher below maps each
+// Protocol: see lib/async/protocol.ts. The dispatcher below maps each
 // request `op` to a v0.3 method call and serializes the result.
 
-import { open as openSync, version as driverVersion } from '../duckdb.mjs';
-import { serializeError, OP, WORKER_READY } from './protocol.mjs';
+import { open as openSync, version as driverVersion } from '../duckdb.ts';
+import { serializeError, OP, WORKER_READY } from './protocol.ts';
+
+import type { Database, Connection, Statement, Row } from '../duckdb.ts';
+import type { Request, Target, DbOrConn } from './protocol.ts';
+
+// Bun's Worker global scope exposes `self`, but the bundled bun-types
+// only declare it when lib.dom is enabled (which this Bun-only package
+// doesn't use). Declare the small surface we need — type-only, no
+// runtime emit.
+declare var self: {
+  onmessage: ((e: MessageEvent) => void) | null;
+  postMessage(message: any): void;
+};
+
+// Narrow a Request to the variant for a given op.
+type Req<Op extends Request['op']> = Extract<Request, { op: Op }>;
+
+// Worker-side appender registry entry. `appender` is never populated in
+// the current design (rows are buffered in `pending` and flushed via
+// conn.append()) but doClose defensively checks it, so it stays typed.
+interface AppEntry {
+  conn: Database | Connection;
+  table: string;
+  columns: string[];
+  pending: unknown[][];
+  poisoned: unknown;
+  appender?: unknown;
+}
+
+// Worker-side iterator registry entry. The wrapper returned by the sync
+// driver's Statement.iterate() always implements .return().
+interface IterEntry {
+  wrapper: AsyncIterableIterator<Row>;
+  stmtId: number;
+  exhausted: boolean;
+}
 
 // ============================================================================
 // Registry
@@ -25,11 +60,11 @@ import { serializeError, OP, WORKER_READY } from './protocol.mjs';
 //
 // Counters start at 1 so id=0 can be sentinel "invalid" if needed.
 
-const dbs   = new Map();
-const conns = new Map();
-const stmts = new Map();
-const apps  = new Map();
-const iters = new Map();
+const dbs   = new Map<number, Database>();
+const conns = new Map<number, Connection>();
+const stmts = new Map<number, Statement<any>>();
+const apps  = new Map<number, AppEntry>();
+const iters = new Map<number, IterEntry>();
 
 let nextDbId = 1, nextConnId = 1, nextStmtId = 1, nextAppId = 1, nextIterId = 1;
 // Generation counter for AbortSignal cancellation (v0.7+): each new
@@ -45,18 +80,18 @@ let connGeneration = 1;
 // re-querying the driver. The v0.3 driver already cascades internally
 // when conn.close() / db.close() is called, so all we need is the
 // inverse map for the registry's own ID cleanup.
-const dbConns       = new Map();   // dbId → Set<connId>
-const connStmts     = new Map();   // connId → Set<stmtId>
-const connApps      = new Map();   // connId → Set<appId>
-const stmtIters     = new Map();   // stmtId → Set<iterId>
+const dbConns       = new Map<number, Set<number>>();   // dbId → Set<connId>
+const connStmts     = new Map<number, Set<number>>();   // connId → Set<stmtId>
+const connApps      = new Map<number, Set<number>>();   // connId → Set<appId>
+const stmtIters     = new Map<number, Set<number>>();   // stmtId → Set<iterId>
 
 // Register helper: insert into both the kind map and the parent index.
-function trackChild(parentMap, parentId, childId) {
+function trackChild(parentMap: Map<number, Set<number>>, parentId: number, childId: number) {
   let set = parentMap.get(parentId);
   if (!set) { set = new Set(); parentMap.set(parentId, set); }
   set.add(childId);
 }
-function untrackChild(parentMap, parentId, childId) {
+function untrackChild(parentMap: Map<number, Set<number>>, parentId: number, childId: number) {
   const set = parentMap.get(parentId);
   if (set) set.delete(childId);
 }
@@ -65,20 +100,20 @@ function untrackChild(parentMap, parentId, childId) {
 // Target resolution
 // ============================================================================
 
-function getDb(id)   { const d = dbs.get(id);   if (!d) throw new Error(`No such Database (id=${id})`);   return d; }
-function getConn(id) { const c = conns.get(id); if (!c) throw new Error(`No such Connection (id=${id})`); return c; }
-function getStmt(id) { const s = stmts.get(id); if (!s) throw new Error(`No such Statement (id=${id})`);  return s; }
-function getApp(id)  { const a = apps.get(id);  if (!a) throw new Error(`No such Appender (id=${id})`);   return a; }
+function getDb(id: number)   { const d = dbs.get(id);   if (!d) throw new Error(`No such Database (id=${id})`);   return d; }
+function getConn(id: number) { const c = conns.get(id); if (!c) throw new Error(`No such Connection (id=${id})`); return c; }
+function getStmt(id: number) { const s = stmts.get(id); if (!s) throw new Error(`No such Statement (id=${id})`);  return s; }
+function getApp(id: number)  { const a = apps.get(id);  if (!a) throw new Error(`No such Appender (id=${id})`);   return a; }
 
 // Resolve a DbOrConn target to a Connection-like driver object — for
 // Database targets, we use the implicit connection via the shortcut
 // methods. The actual routing here matches v0.3: db.query() / db.all()
 // / db.prepare() etc. internally route through db's lazy default
 // Connection.
-function resolveDbOrConn(target) {
+function resolveDbOrConn(target: DbOrConn): Database | Connection {
   if (target.kind === 'db')   return getDb(target.id);
   if (target.kind === 'conn') return getConn(target.id);
-  throw new Error(`Invalid target kind for DbOrConn op: ${target.kind}`);
+  throw new Error(`Invalid target kind for DbOrConn op: ${(target as Target).kind}`);
 }
 
 // ============================================================================
@@ -88,7 +123,7 @@ function resolveDbOrConn(target) {
 // Each handler is `async` so it can `await` driver calls. The dispatcher
 // catches and serializes any throw.
 
-async function handleOpen(req) {
+async function handleOpen(req: Req<'open'>) {
   // v0.5+: OpenOptions are passed through to the v0.3 driver as the
   // second arg. The driver does the duckdb_create_config /
   // duckdb_open_ext dance; we just hand it the user's opts.
@@ -99,17 +134,17 @@ async function handleOpen(req) {
   return { dbId: id };
 }
 
-async function handleClose(req) {
+async function handleClose(req: Req<'close'>) {
   return doClose(req.target, /* fromRelease */ false);
 }
 
-async function handleRelease(req) {
+async function handleRelease(req: Req<'release'>) {
   // GC-triggered cleanup. Treat like close() but never raise.
   try { return await doClose(req.target, /* fromRelease */ true); }
   catch { return { ok: true }; }
 }
 
-async function doClose(target) {
+async function doClose(target: Target, _fromRelease?: boolean): Promise<{ ok: true }> {
   const { kind, id } = target;
   if (kind === 'db') {
     const db = dbs.get(id);
@@ -167,15 +202,15 @@ async function doClose(target) {
   throw new Error(`Unknown target kind: ${kind}`);
 }
 
-async function closeIterator(iterId) {
+async function closeIterator(iterId: number) {
   const entry = iters.get(iterId);
   if (!entry) return;
-  try { await entry.wrapper.return(); } catch { /* swallow */ }
+  try { await entry.wrapper.return!(); } catch { /* swallow */ }
   iters.delete(iterId);
   for (const set of stmtIters.values()) set.delete(iterId);
 }
 
-async function handleConnect(req) {
+async function handleConnect(req: Req<'connect'>) {
   const db = getDb(req.target.id);
   const conn = db.connect();
   const id = nextConnId++;
@@ -200,7 +235,7 @@ async function handleConnect(req) {
   };
 }
 
-async function handleQuery(req) {
+async function handleQuery(req: Req<'query'>) {
   const target = resolveDbOrConn(req.target);
   switch (req.method) {
     case 'query':
@@ -208,11 +243,11 @@ async function handleQuery(req) {
     case 'get':  return await target.get(req.sql, req.params);
     case 'run':  return await target.run(req.sql, req.params);
     case 'exec': await target.exec(req.sql); return { ok: true };
-    default: throw new Error(`Unknown query method: ${req.method}`);
+    default: throw new Error(`Unknown query method: ${(req as { method: string }).method}`);
   }
 }
 
-async function handlePrepare(req) {
+async function handlePrepare(req: Req<'prepare'>) {
   const target = resolveDbOrConn(req.target);
   const stmt = await target.prepare(req.sql);
   const id = nextStmtId++;
@@ -235,19 +270,19 @@ async function handlePrepare(req) {
   return { stmtId: id };
 }
 
-async function handleStmtCall(req) {
+async function handleStmtCall(req: Req<'stmtCall'>) {
   const stmt = getStmt(req.target.id);
   switch (req.method) {
     case 'all': return await stmt.all(req.params);
     case 'get': return await stmt.get(req.params);
     case 'run': return await stmt.run(req.params);
-    default: throw new Error(`Unknown stmt method: ${req.method}`);
+    default: throw new Error(`Unknown stmt method: ${(req as { method: string }).method}`);
   }
 }
 
 // ── streaming ──────────────────────────────────────────────────────────
 
-async function handleIterStart(req) {
+async function handleIterStart(req: Req<'iterStart'>) {
   const stmt = getStmt(req.target.id);
   const wrapper = stmt.iterate(req.params);
   const id = nextIterId++;
@@ -261,7 +296,7 @@ async function handleIterStart(req) {
   return { iterId: id, columns: [] };
 }
 
-async function handleIterNext(req) {
+async function handleIterNext(req: Req<'iterNext'>) {
   const entry = iters.get(req.iterId);
   if (!entry) return { rows: [], done: true };
   if (entry.exhausted) return { rows: [], done: true };
@@ -279,7 +314,7 @@ async function handleIterNext(req) {
   // rows per request — this gives reasonable throughput without
   // unbounded buffering.
   const MAX_ROWS_PER_NEXT = 2048;
-  const rows = [];
+  const rows: Row[] = [];
   for (let i = 0; i < MAX_ROWS_PER_NEXT; i++) {
     const r = await entry.wrapper.next();
     if (r.done) { entry.exhausted = true; break; }
@@ -288,7 +323,7 @@ async function handleIterNext(req) {
   return { rows, done: entry.exhausted };
 }
 
-async function handleIterReturn(req) {
+async function handleIterReturn(req: Req<'iterReturn'>) {
   await closeIterator(req.iterId);
   return { ok: true };
 }
@@ -304,7 +339,7 @@ async function handleIterReturn(req) {
 // This means peak memory is bounded by the proxy's batch size + however
 // many batches arrive before flush is called. Documented in RFC §9.
 
-async function handleAppendCreate(req) {
+async function handleAppendCreate(req: Req<'appendCreate'>) {
   const target = resolveDbOrConn(req.target);
   const id = nextAppId++;
   // For Database targets, target gives us the lazy default Connection
@@ -322,7 +357,7 @@ async function handleAppendCreate(req) {
   return { appId: id };
 }
 
-async function handleAppendRows(req) {
+async function handleAppendRows(req: Req<'appendRows'>) {
   const entry = getApp(req.target.id);
   if (entry.poisoned) throw entry.poisoned;
   // Append rows to the worker-side buffer. The actual conn.append()
@@ -332,14 +367,17 @@ async function handleAppendRows(req) {
   return { rows: req.rows.length };
 }
 
-async function handleAppendFlush(req) {
+async function handleAppendFlush(req: Req<'appendFlush'>) {
   const entry = getApp(req.target.id);
   if (entry.poisoned) throw entry.poisoned;
   if (entry.pending.length === 0) return { rows: 0 };
   const rows = entry.pending;
   entry.pending = [];
   try {
-    const result = await entry.conn.append(entry.table, entry.columns, rows);
+    // Cast: entry.conn is typed Database | Connection, but only
+    // Connection has append() — see handleAppendCreate's comment (the
+    // async proxy always sends Connection targets for appenders).
+    const result = await (entry.conn as Connection).append(entry.table, entry.columns, rows);
     return { rows: result.rows };
   } catch (err) {
     entry.poisoned = err;
@@ -356,9 +394,9 @@ async function handleAppendFlush(req) {
 // id: <new id> } and routes ops there. On callback resolve → txnCommit;
 // on reject → txnRollback + rethrow.
 
-async function handleTxnBegin(req) {
+async function handleTxnBegin(req: Req<'txnBegin'>) {
   // Find the owning Database. If target is a conn, walk up via dbConns.
-  let db;
+  let db: Database | undefined;
   if (req.target.kind === 'db') db = getDb(req.target.id);
   else {
     for (const [dbId, set] of dbConns) {
@@ -385,7 +423,7 @@ async function handleTxnBegin(req) {
   };
 }
 
-async function handleTxnCommit(req) {
+async function handleTxnCommit(req: Req<'txnCommit'>) {
   const conn = getConn(req.target.id);
   await conn.query('COMMIT');
   // Don't auto-close the conn here — the proxy might want to inspect
@@ -394,7 +432,7 @@ async function handleTxnCommit(req) {
   return { ok: true };
 }
 
-async function handleTxnRollback(req) {
+async function handleTxnRollback(req: Req<'txnRollback'>) {
   const conn = getConn(req.target.id);
   try { await conn.query('ROLLBACK'); } catch { /* swallow */ }
   return { ok: true };
@@ -404,7 +442,9 @@ async function handleTxnRollback(req) {
 // Dispatcher
 // ============================================================================
 
-const HANDLERS = {
+// Typed loosely (req: any): each handler narrows to its own Request
+// variant; the dispatcher looks handlers up by wire-provided op string.
+const HANDLERS: Record<string, (req: any) => Promise<unknown>> = {
   [OP.OPEN]:         handleOpen,
   [OP.CLOSE]:        handleClose,
   [OP.RELEASE]:      handleRelease,

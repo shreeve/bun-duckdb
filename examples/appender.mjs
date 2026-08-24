@@ -5,7 +5,7 @@
 // Run:
 //   bun examples/appender.mjs
 
-import { open } from '../lib/duckdb.mjs';
+import { open } from '../lib/duckdb.ts';
 
 const db = open(':memory:');
 const conn = db.connect();
