@@ -34,7 +34,7 @@ on:
       - 'v*'
 
 env:
-  DUCKDB_VERSION: v1.5.2
+  DUCKDB_VERSION: v1.5.5
 
 jobs:
   # ============================================================
@@ -161,7 +161,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.4.0
 
       - name: Setup Node (for npm publish)
         uses: actions/setup-node@v4

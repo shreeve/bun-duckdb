@@ -7,8 +7,10 @@ on:
     branches: [main]
 
 # Pin DuckDB version in one place — bump as we adopt newer releases.
+# The v2-canary job below additionally tracks DuckDB's nightly (v2.x)
+# builds without gating the merge.
 env:
-  DUCKDB_VERSION: v1.5.2
+  DUCKDB_VERSION: v1.5.5
 
 jobs:
   test:
@@ -48,7 +50,16 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # Pinned: the driver certifies a specific Bun (engines >=1.4.0).
+          # The v2-canary job runs `latest` so upstream Bun/FFI regressions
+          # surface without blocking merges.
+          bun-version: 1.4.0
+
+      - name: Install dev dependencies (typescript for the typecheck gate)
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck (tsc --noEmit, strict)
+        run: bunx tsc --noEmit
 
       - name: Install libduckdb (Linux)
         if: runner.os == 'Linux'
@@ -142,3 +153,43 @@ jobs:
           name: ${{ matrix.shim_artifact }}
           path: lib/${{ matrix.shim_artifact }}
           retention-days: 7
+
+  # ============================================================
+  # Canary — DuckDB v2 nightly + Bun latest. Never blocks a merge;
+  # exists so a DuckDB 2.x C-API break or a Bun FFI regression is a
+  # red canary on the commit that first sees it, not a surprise at
+  # the next release.
+  # ============================================================
+  v2-canary:
+    name: canary (DuckDB v2 nightly, Bun latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dev dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install libduckdb (nightly)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o duckdb-nightly.zip \
+            "https://artifacts.duckdb.org/latest/duckdb-binaries-linux-amd64.zip"
+          unzip -q duckdb-nightly.zip -d nightly
+          unzip -q nightly/libduckdb-linux-amd64.zip -d nightly/lib || true
+          LIBDIR=nightly/lib; [ -f "$LIBDIR/libduckdb.so" ] || LIBDIR=nightly
+          sudo cp "$LIBDIR/libduckdb.so" /usr/local/lib/
+          sudo cp "$LIBDIR/duckdb.h" /usr/local/include/ || true
+          sudo ldconfig
+
+      - name: Build shim against nightly header
+        run: make -C lib TAGGED=1
+
+      - name: Run tests against v2 nightly
+        run: bun test
